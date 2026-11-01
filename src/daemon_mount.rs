@@ -1668,6 +1668,9 @@ impl ClearOutcome {
 /// 多做一次已幂等的归属校验，不会造成叠加。
 fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearOutcome {
     let state_path = plan.state_path.as_str();
+    // TEST ONLY: 标记存在时强制清理视图根并跳过 keep-root，用于真机验证深栈清理（提交前移除）。
+    let force_unmount_stack =
+        std::path::Path::new("/data/adb/modules/storage.redirect.x/.test_unmount_stack").exists();
     let fuse_children = read_fuse_children(state_path);
     let mut targets = read_mount_targets(state_path);
     // 短路场景可能没有 state 文件，但历史版本已经写过 mount_identity；
@@ -1690,7 +1693,10 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             user_id,
         ));
     }
-    let targets = module_paths::normalize_mount_targets(&targets);
+    let mut targets = module_paths::normalize_mount_targets(&targets);
+    if force_unmount_stack {
+        targets = vec!["/storage/emulated/0".to_string()];
+    }
     if targets.is_empty() && fuse_children.is_empty() {
         // 两个账本都为空不代表命名空间干净：写状态失败、账本被外部清理或旧版本
         // 残留都可能在目标上留下本模块的层，而这些层没有记录，后续清理不会再被
@@ -1750,7 +1756,14 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
         let live_layer = live
             .as_ref()
             .map(|mount| (mount.source.as_str(), mount.root.as_str()));
-        if should_keep_reload_redirect_root(target, request, &plan.scoped_fuse_roots, live_layer) {
+        if !force_unmount_stack
+            && should_keep_reload_redirect_root(
+                target,
+                request,
+                &plan.scoped_fuse_roots,
+                live_layer,
+            )
+        {
             log::info!(
                 "daemon unmount keep redirect root target={} mount_id={}",
                 target,
