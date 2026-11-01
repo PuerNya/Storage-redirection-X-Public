@@ -28,7 +28,7 @@ env:
 
 jobs:
   quality:
-    if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
+    if: (github.repository == 'z1298808165/Storage-redirection-X-Public' || github.repository == 'PuerNya/Storage-redirection-X-Public') && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
@@ -81,7 +81,7 @@ jobs:
           ./scripts/validate-code-quality.ps1 -BaseRef $baseRef -Ref HEAD
 
   prepare:
-    if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
+    if: (github.repository == 'z1298808165/Storage-redirection-X-Public' || github.repository == 'PuerNya/Storage-redirection-X-Public') && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
