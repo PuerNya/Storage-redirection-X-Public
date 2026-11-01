@@ -1285,6 +1285,13 @@ fn reconcile_running_apps(
                 // 用于区分「MediaProvider 没在跑」与「判定没认出它」。
                 media_like_names.push(proc.package_name.clone());
             }
+            // TEST ONLY: 让 daemon 跳过指定包，迫使应用启动由 companion 接管（提交前移除）。
+            if std::path::Path::new("/data/adb/modules/storage.redirect.x/.test_skip_calendar")
+                .exists()
+                && proc.package_name == "com.coloros.calendar"
+            {
+                continue;
+            }
             if should_skip_process(&proc) {
                 skipped += 1;
                 continue;
