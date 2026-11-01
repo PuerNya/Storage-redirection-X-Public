@@ -1668,8 +1668,21 @@ impl ClearOutcome {
 /// 多做一次已幂等的归属校验，不会造成叠加。
 fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearOutcome {
     let state_path = plan.state_path.as_str();
-    let fuse_children = read_fuse_children(state_path);
+    // TEST ONLY: 固定包名强制进入空账本分支，用于真机验证兜底清理（提交前移除）。
+    let force_empty_records = request.package_name == "com.coloros.note";
+    let fuse_children = if force_empty_records {
+        Vec::new()
+    } else {
+        read_fuse_children(state_path)
+    };
     let mut targets = read_mount_targets(state_path);
+    // TEST ONLY: 证明该包的清理路径确实进入本函数（提交前移除）。
+    log::warn!(
+        "TEST clear_previous_mounts pkg={} targets={} force={}",
+        request.package_name,
+        targets.len(),
+        force_empty_records
+    );
     // 短路场景可能没有 state 文件，但历史版本已经写过 mount_identity；
     // 仅依赖 state 会让这些挂载层永久漏清理，之后每轮 supervise 都可能继续叠挂。
     // 先把账本登记的目标加入候选，实际摘除仍由 mount_id/source 归属校验保护。
@@ -1690,7 +1703,11 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             user_id,
         ));
     }
-    let targets = module_paths::normalize_mount_targets(&targets);
+    let targets = if force_empty_records {
+        Vec::new()
+    } else {
+        module_paths::normalize_mount_targets(&targets)
+    };
     if targets.is_empty() && fuse_children.is_empty() {
         // 两个账本都为空不代表命名空间干净：写状态失败、账本被外部清理或旧版本
         // 残留都可能在目标上留下本模块的层，而这些层没有记录，后续清理不会再被
@@ -1698,6 +1715,12 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
         // 重定向的层；仍有无法摘除的层时保守返回 Unverified，不进入挂载。
         let leftovers =
             crate::module_mount_source::app_redirect_mounts_in(0, &request.package_name);
+        // TEST ONLY: 输出兜底识别结果（提交前移除）。
+        log::warn!(
+            "TEST leftovers pkg={} count={}",
+            request.package_name,
+            leftovers.len()
+        );
         let mut leftover_cleared = true;
         for mount in leftovers.iter().rev() {
             let Ok(c_target) = CString::new(mount.mount_point.as_str()) else {
