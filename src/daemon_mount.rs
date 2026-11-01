@@ -40,6 +40,9 @@ const PARENT_RECV_GRACE_TIMEOUT_SEC: i64 = 1;
 const FUSE_READY_TIMEOUT_SEC: i64 = 4;
 const DAEMON_MOUNT_SLOW_MS: i64 = 20;
 const MAX_UNMOUNT_PASSES_PER_TARGET: usize = 32;
+/// TEST ONLY（仅 test/force-scoped2 分支）：存在该标记文件时强制 scoped 会话路径，
+/// 用于在真机上验证账本登记、会话回收与预算；正式分支不含这段。
+const FORCE_SCOPED_MARKER: &str = "/data/adb/modules/storage.redirect.x/.test_force_scoped";
 /// 状态缺失后的重挂退避窗口（毫秒）。
 ///
 /// 状态缺失的常见来源是应用侧状态文件尚未落盘、被清理或挂载失败回滚，此时立即重挂
@@ -1004,7 +1007,21 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
         false,
     );
     planner.set_file_monitor_enabled(request.is_file_monitor_enabled);
-    let scoped_fuse_roots = plan.scoped_fuse_roots.as_slice();
+    // TEST ONLY：标记文件存在时跳过宿主预接入，并把空根补成存储视图根，强制本轮走
+    // scoped FUSE 会话。
+    let force_scoped = std::path::Path::new(FORCE_SCOPED_MARKER).exists();
+    let forced_scoped_roots = if force_scoped {
+        let user_id = crate::platform::user_id_from_uid(request.uid);
+        vec![crate::platform::paths::storage_user_root_for_user(user_id)]
+    } else {
+        Vec::new()
+    };
+    let planned_fuse_roots = plan.scoped_fuse_roots.as_slice();
+    let scoped_fuse_roots: &[String] = if force_scoped && planned_fuse_roots.is_empty() {
+        forced_scoped_roots.as_slice()
+    } else {
+        planned_fuse_roots
+    };
     let cleared_system_view_before_preattach =
         if shared_host_preattach_candidate(request, scoped_fuse_roots)
             && crate::system_fuse_view::should_clear_system_fuse_view_for_platform()
@@ -1030,7 +1047,11 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     // 并发登记时应答可能被别的 worker 取走，本方只能继续等，最坏会阻塞到预算耗尽。因此
     // 给它一个「剩余时间减去 scoped 回退所需」的上限，宁可提前放弃走 scoped，也不要挂在
     // 等应答上被父进程 SIGKILL。
-    let preattached_host = preattach_shared_host(request, scoped_fuse_roots, deadline_ms);
+    let preattached_host = if force_scoped {
+        None
+    } else {
+        preattach_shared_host(request, scoped_fuse_roots, deadline_ms)
+    };
     // 无规则短路标记贯穿成功分支：短路跳过 planner 完整路径后，state 落账
     // 也必须跳过（无挂载产物却留下 state=mounted 残留账，supervise/恢复流程
     // 会据此误判"已在场"——与 companion 侧 no_rules_short_circuit 同因）。
