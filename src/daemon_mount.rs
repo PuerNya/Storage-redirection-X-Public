@@ -882,6 +882,38 @@ fn run_mount_in_forked_child(request: &MountRequest) -> bool {
     unsafe { libc::_exit(if ok { 0 } else { 1 }) };
 }
 
+/// 摘除本轮在应用命名空间里新建的挂载层，返回成功摘除的数量。
+///
+/// 仅供失败回滚使用：状态文件写不进去时账本也不会登记，这些层没有归属判据，
+/// 后续清理与配置替换都无从得知它们存在，只能一直留到应用退出。按挂载记录
+/// 反序摘除（后挂的先摘），`MNT_DETACH` 保证仍有引用的层延迟消失、不阻塞回滚；
+/// 路径已不在（EINVAL/ENOENT）视为已摘除，不重复报错。
+fn detach_round_mount_targets(targets: &[String]) -> usize {
+    let mut detached = 0usize;
+    for target in targets.iter().rev() {
+        let Ok(c_target) = CString::new(target.as_str()) else {
+            continue;
+        };
+        // SAFETY: c_target 是以 NUL 结尾的合法路径且在本次调用期间保持存活；MNT_DETACH
+        // 只影响当前命名空间的挂载视图，不触碰其它命名空间。
+        if unsafe { umount2(c_target.as_ptr(), MNT_DETACH) } == 0 {
+            detached += 1;
+            log::info!("daemon mount rollback detached target={}", target);
+            continue;
+        }
+        let errno = last_errno();
+        if errno != libc::EINVAL && errno != libc::ENOENT {
+            log::warn!(
+                "daemon mount rollback detach failed target={} errno={} {}",
+                target,
+                errno,
+                errno_text(errno)
+            );
+        }
+    }
+    detached
+}
+
 fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_int) -> bool {
     // 父进程只等 parent_timeout_sec：子进程必须在这之前回包，否则会被判卡死并 SIGKILL，
     // 这一轮挂载作废且可能留下死层。这里记下截止时间，后面所有可阻塞步骤都按剩余量收敛。
@@ -1129,12 +1161,17 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             mounted_targets = planner.take_mounted_targets();
         }
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
-            // 状态写失败必须回滚本轮挂载：账本缺失的层没有归属判据，后续清理只能按
-            // 路径猜（宿主会话跨应用共享，回滚只卸载目标、不终止宿主进程）。
+            // 状态写失败必须回滚本轮全部挂载：state 与账本都没有记录时，这些层没有
+            // 任何归属判据，后续清理流程不知道它们存在，配置变更也无法把它们替换掉，
+            // 只能留到应用退出。先按挂载记录反序摘 bind 层，再回滚 FUSE 目标（宿主
+            // 会话跨应用共享，回滚只卸载目标、不终止宿主进程）。
+            let detached = detach_round_mount_targets(&mounted_targets);
             log::warn!(
-                "daemon mount state save failed pid={} rollback_mounts={}",
+                "daemon mount state save failed pid={} pkg={} rollback_mounts={} rollback_targets={}",
                 request.pid,
-                fuse_children.len()
+                request.package_name,
+                fuse_children.len(),
+                detached
             );
             rollback_scoped_fuse_services(&fuse_children);
             let _ = send_mount_result(sock, -1);
