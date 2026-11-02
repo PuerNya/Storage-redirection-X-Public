@@ -377,8 +377,15 @@ impl RuntimeFlow {
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
             record_media_hook_install_state("pre_java_start");
-            crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
-            install_java_hook(self.env);
+            let skip_diag_java_hook =
+                crate::platform::system_property_get("persist.srx.diag.skip_java_hook").as_deref()
+                    == Some("1");
+            if skip_diag_java_hook {
+                log::warn!("media java hook skipped by diagnostic property");
+            } else {
+                crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
+                install_java_hook(self.env);
+            }
             record_media_hook_install_state("pre_java_done");
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
