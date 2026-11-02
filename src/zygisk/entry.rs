@@ -48,6 +48,12 @@ pub unsafe extern "C" fn zygisk_module_entry(table: *mut ApiTable, env: *mut jni
 }
 
 unsafe fn module_entry_impl(table: *mut ApiTable, env: *mut jni_sys::JNIEnv) {
+    // 诊断构建：属性置位时完全不注册 Zygisk 回调，用于隔离进程注入路径是否是
+    // MediaProvider 启动超时的根因。仅存在于诊断分支，不进入正式提交。
+    if crate::platform::system_property_get("persist.srx.diag.zygisk_off").as_deref() == Some("1") {
+        log::warn!("diagnostic: zygisk hooks disabled by property");
+        return;
+    }
     // 诊断（2026-10-30 A14 模拟器）：Zygisk Next 加载模块 so 后入口是否真的被
     // 调用无法从 running.log 区分（Logger 尚未初始化时 info 日志不可见），这里
     // 直接写 logcat。tag=SrxEntry，可用 `logcat | grep SrxEntry` 直接核对。
