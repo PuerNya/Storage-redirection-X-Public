@@ -12,7 +12,7 @@ pub(crate) use crate::fuse_host_control::spawn_host_control_loop;
 use crate::fuse_host_control::{close_host_control_fd, set_host_control_fd};
 use crate::platform::paths;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// 宿主挂载点：放在模块私有目录下，不落在任何存储别名上，避免与应用命名空间发生传播耦合。
@@ -50,6 +50,31 @@ static FUSE_HOST: OnceLock<RwLock<Option<Arc<FuseHost>>>> = OnceLock::new();
 pub(crate) fn host_slot() -> &'static RwLock<Option<Arc<FuseHost>>> {
     FUSE_HOST.get_or_init(|| RwLock::new(None))
 }
+
+/// 最近一次宿主退出状态（`waitpid` 原始 status；-1 表示未观测到）。
+static LAST_HOST_EXIT_STATUS: AtomicI32 = AtomicI32::new(-1);
+/// 本轮开机是否已观测到宿主被系统存储重置 abort。
+static HOST_ABORTED_THIS_BOOT: AtomicBool = AtomicBool::new(false);
+/// 首次观测到 `sys.boot_completed=1` 的时刻；宿主创建从该时刻起再等稳定窗口。
+static HOST_BOOT_SETTLE_BASE_MS: AtomicI64 = AtomicI64::new(0);
+/// 宿主创建被推迟时的单次日志门闩，避免每轮 reconcile 刷屏。
+static HOST_GATE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// 开机后等待首轮存储重置结束再创建宿主的时间窗口。
+///
+/// 本机实证：vold 在 `sys.boot_completed` 前后执行 `volume abort_fuse`，宿主的共享
+/// FUSE 连接被内核 abort 后会话线程正常结束（exit 0），daemon 随即重建；若应用已接入，
+/// 会留下死层直到下一轮重挂。把宿主创建推迟到该窗口之后，开机风暴不再命中宿主。
+const HOST_BOOT_SETTLE_MS: i64 = 20_000;
+
+/// abort 后持久退回 namespace 的判定窗口（自首次 boot_completed 起）。
+///
+/// 窗口内命中的 abort 视为设备/ROM 的存储生命周期行为，写入持久标记；窗口外（用户
+/// 手动 `vdc volume abort_fuse` 或调试）只在本轮开机内退回 namespace。
+const HOST_ABORT_PERSIST_WINDOW_MS: i64 = 600_000;
+
+/// 持久降级标记：存在时后续开机也直接使用 namespace 后端，不再创建共享宿主。
+const HOST_UNSTABLE_MARKER: &str = ".fuse_host_unstable";
 
 /// 宿主会话是否仍然可用。
 ///
@@ -108,11 +133,113 @@ fn process_is_zombie(pid: i32) -> bool {
 fn reap_exited_host_child(pid: libc::pid_t) {
     let mut status: libc::c_int = 0;
     // SAFETY: pid 是本模块 fork 出的子进程；WNOHANG 只在它已退出时回收，不会阻塞。
-    unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    // SAFETY: status 只在 waitpid 返回该 pid 后读取，内核已完整写入。
+    let ret = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    if ret == pid {
+        LAST_HOST_EXIT_STATUS.store(status, Ordering::Release);
+    }
+}
+
+fn host_unstable_marker_path() -> std::path::PathBuf {
+    std::path::Path::new(crate::platform::module_paths::CONFIG_DIR).join(HOST_UNSTABLE_MARKER)
+}
+
+/// 系统 abort 后是否强制 namespace；供挂载规划读取。
+pub fn namespace_fallback_forced() -> bool {
+    HOST_ABORTED_THIS_BOOT.load(Ordering::Acquire) || host_unstable_marker_path().exists()
+}
+
+/// 把 abort 后的后端选择收敛到 namespace：Auto/Fuse 都退回 namespace，避免继续踩死挂载。
+pub fn effective_backend_mode(
+    configured: crate::config::StorageBackendMode,
+) -> crate::config::StorageBackendMode {
+    if namespace_fallback_forced() {
+        crate::config::StorageBackendMode::Namespace
+    } else {
+        configured
+    }
+}
+
+/// 宿主创建是否已越过开机稳定窗口。首次观测到 boot_completed 时开始计时。
+fn host_boot_settled() -> bool {
+    if !crate::platform::is_boot_completed() {
+        return false;
+    }
+    let now = crate::platform::paths::monotonic_ms();
+    let base = HOST_BOOT_SETTLE_BASE_MS.load(Ordering::Acquire);
+    if base == 0 {
+        HOST_BOOT_SETTLE_BASE_MS.store(now, Ordering::Release);
+        return false;
+    }
+    now.saturating_sub(base) >= HOST_BOOT_SETTLE_MS
+}
+
+/// 模拟器/测试设备：没有 ColorOS 的 vold 生命周期行为，保持旧有的立即建宿主语义。
+fn running_on_emulator() -> bool {
+    let is_one = |name: &str| crate::platform::system_property_get(name).as_deref() == Some("1");
+    is_one("ro.kernel.qemu") || is_one("ro.boot.qemu")
+}
+
+/// 当前是否允许创建/使用共享宿主：显式 namespace、已 abort、持久降级或开机窗口内都拒绝。
+fn host_usage_allowed() -> bool {
+    // `SRT_FUSE_HOST_ATTACH` 是 daemon 侧的总开关：关闭时连宿主都不创建，媒体视图、
+    // 监控等所有宿主使用路径一并停用。仅靠后端配置不行——配置面的 StorageBackendMode
+    // 由 parse 固定返回 Auto，后端选择是运行时规划结果，不是关闭开关。
+    if !host_attach_enabled() || namespace_fallback_forced() {
+        return false;
+    }
+    if running_on_emulator() {
+        return true;
+    }
+    host_boot_settled()
+}
+
+fn log_host_gate_once(reason: &str) {
+    if !HOST_GATE_LOGGED.swap(true, Ordering::AcqRel) {
+        log::warn!("fuse host creation deferred reason={reason}");
+    }
 }
 
 fn host_is_dead(host: &FuseHost) -> bool {
     !host_is_alive(host)
+}
+
+/// 宿主被清除后判定是否为系统 abort 并执行降级。
+///
+/// 判定条件：干净退出（exit code 0、无信号）。系统 `abort_fuse` 会让会话线程正常
+/// 返回，这正是本次真机故障的签名；停滞看门狗或锚点自愈主动结束的会话同样是故障
+/// 路径，一并退回 namespace 是保守且安全的选择。
+fn note_host_exit_after_clear() {
+    let status = LAST_HOST_EXIT_STATUS.swap(-1, Ordering::AcqRel);
+    if status < 0 {
+        return;
+    }
+    // WIFEXITED/WEXITSTATUS 是 wait status 的标准解码宏，status 来自 waitpid 原始值。
+    let clean = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    if !clean {
+        return;
+    }
+    let already = HOST_ABORTED_THIS_BOOT.swap(true, Ordering::AcqRel);
+    let base = HOST_BOOT_SETTLE_BASE_MS.load(Ordering::Acquire);
+    let persist_window = !crate::platform::is_boot_completed()
+        || base == 0
+        || crate::platform::paths::monotonic_ms().saturating_sub(base)
+            <= HOST_ABORT_PERSIST_WINDOW_MS;
+    let mut persisted = false;
+    if persist_window {
+        persisted = std::fs::write(
+            host_unstable_marker_path(),
+            b"system storage reset aborted shared fuse host\n",
+        )
+        .is_ok();
+    }
+    if !already {
+        log::warn!(
+            "fuse host aborted by system storage reset fallback=namespace persistent={} window={}",
+            persisted,
+            persist_window
+        );
+    }
 }
 
 /// 已建立的共享宿主会话句柄。
@@ -1698,6 +1825,10 @@ fn reap_host_child(pid: libc::pid_t) -> String {
 
 /// 建立共享宿主会话。失败返回 `None`（不抛出），调用方据此降级而不影响主循环。
 pub fn spawn_fuse_host() -> Option<FuseHost> {
+    if !host_usage_allowed() {
+        return None;
+    }
+    LAST_HOST_EXIT_STATUS.store(-1, Ordering::Release);
     let mut ready_sockets = [0; 2];
     // SAFETY: ready_sockets 是本地数组，长度合法，socketpair 填充两个 fd。
     // 允许英文：系统调用 API 名称保持原样以便检索。
@@ -2489,9 +2620,11 @@ pub fn wait_for_host_session_view(uid: i32, policy_fingerprint: u64) -> Option<H
     if !host_attach_enabled() {
         return None;
     }
-    if let Some(view) = read_host_session_view()
-        && view.policy_fingerprints.get(&(uid as u32)) == Some(&policy_fingerprint)
-    {
+    // 没有可用快照（宿主未创建、已 abort 降级、开机窗口内未就绪）时立即回退：
+    // 这里的等待预算按"daemon 即将预登记"设计，宿主根本不存在的场景白等 6 秒只会
+    // 拖慢应用冷启动，且永远不会等到结果。
+    let view = read_host_session_view()?;
+    if view.policy_fingerprints.get(&(uid as u32)) == Some(&policy_fingerprint) {
         return Some(view);
     }
     let now = crate::platform::paths::monotonic_ms();
@@ -2569,6 +2702,7 @@ pub(crate) fn clear_if_dead_with_reason(reason: &str) -> bool {
             dead_pid.unwrap_or(-1),
             HOST_GENERATION.load(Ordering::Acquire)
         );
+        note_host_exit_after_clear();
     }
     cleared
 }
@@ -2605,6 +2739,17 @@ pub fn get_fuse_host() -> Option<Arc<FuseHost>> {
 pub fn ensure_global() -> bool {
     if get_fuse_host().is_some() {
         return true;
+    }
+    if !host_usage_allowed() {
+        let reason = if !host_attach_enabled() {
+            "attach_disabled"
+        } else if namespace_fallback_forced() {
+            "system_abort_fallback"
+        } else {
+            "boot_settle"
+        };
+        log_host_gate_once(reason);
+        return false;
     }
     let _ = clear_if_dead();
     let now = crate::platform::paths::monotonic_ms();
@@ -2654,6 +2799,10 @@ pub fn wait_for_host_session() -> bool {
     }
     if get_fuse_host().is_some() {
         return true;
+    }
+    if !host_usage_allowed() {
+        log_host_gate_once("wait_gate");
+        return false;
     }
     let now = crate::platform::paths::monotonic_ms();
     let last_fail = LAST_HOST_WAIT_FAIL_MS.load(Ordering::Relaxed);
