@@ -117,8 +117,11 @@ impl RuntimeFlow {
         // install_java_hook；若最终只留下 specialize_enter，说明模块已注入该进程
         // 但从更早的分支返回了。两者需要相反的修复，而 logcat 采集晚于
         // MediaProvider specialize、writer 进程又不写模块日志文件，事后无从区分。
-        if policy::is_media_provider_package(&self.package_name) {
+        let media_pre_started_ms = monotonic_ms();
+        let is_media_provider = policy::is_media_provider_package(&self.package_name);
+        if is_media_provider {
             record_media_hook_install_state("specialize_enter");
+            log::warn!("media pre enter pid={} uid={}", self.app_pid, self.app_uid);
         }
 
         log::debug!(
@@ -300,6 +303,12 @@ impl RuntimeFlow {
             );
         }
 
+        if is_media_provider {
+            log::warn!(
+                "media pre config done ms={}",
+                monotonic_ms().saturating_sub(media_pre_started_ms)
+            );
+        }
         let writer_context_started_ms = monotonic_ms();
         let mut writer_context = resolve_system_writer_context(
             &self.package_name,
@@ -314,6 +323,13 @@ impl RuntimeFlow {
             self.should_keep_module_loaded = true;
         }
         perf_stages.writer_context_ms = monotonic_ms().saturating_sub(writer_context_started_ms);
+        if is_media_provider {
+            log::warn!(
+                "media pre writer done ms={} fuse_fix={}",
+                monotonic_ms().saturating_sub(media_pre_started_ms),
+                self.should_install_fuse_fix
+            );
+        }
 
         let enabled_scan_started_ms = monotonic_ms();
         let has_enabled_apps = if is_system_writer {
@@ -371,10 +387,22 @@ impl RuntimeFlow {
         // MediaProvider 的重定向 Java hook 仍在 pre 阶段安装；SAF 来源识别
         // 走 native 文件监视路径，避免在系统 provider 内加载 LSPlant。
         if should_install_media_provider_java_hook {
+            if is_media_provider {
+                log::warn!(
+                    "media pre java hook start ms={}",
+                    monotonic_ms().saturating_sub(media_pre_started_ms)
+                );
+            }
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
             crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
             install_java_hook(self.env);
+            if is_media_provider {
+                log::warn!(
+                    "media pre java hook done ms={}",
+                    monotonic_ms().saturating_sub(media_pre_started_ms)
+                );
+            }
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
             && (self.is_system_writer_hook_redirect || self.should_monitor)
@@ -394,6 +422,12 @@ impl RuntimeFlow {
             self.should_monitor
         );
 
+        if is_media_provider {
+            log::warn!(
+                "media pre route start ms={}",
+                monotonic_ms().saturating_sub(media_pre_started_ms)
+            );
+        }
         let route_config_started_ms = monotonic_ms();
         let (
             allowed_real_paths,
