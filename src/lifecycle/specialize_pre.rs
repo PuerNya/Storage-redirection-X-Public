@@ -374,7 +374,15 @@ impl RuntimeFlow {
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
             crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
-            install_java_hook(self.env);
+            // 诊断：属性置位时跳过 MediaProvider 的 Java hook 安装（fuse fix/SFA 的
+            // native 路径不受影响），用于确认 specialize 卡点是否在 LSPlant 安装。
+            if crate::platform::system_property_get("persist.srx.diag.skip_java_hook").as_deref()
+                != Some("1")
+            {
+                install_java_hook(self.env);
+            } else {
+                log::warn!("diagnostic: media provider java hook skipped");
+            }
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
             && (self.is_system_writer_hook_redirect || self.should_monitor)
