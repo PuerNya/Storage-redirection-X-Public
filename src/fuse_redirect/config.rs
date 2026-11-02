@@ -1092,12 +1092,47 @@ pub fn mount_host_fuse(
     // 也是用户侧"常驻内存几百兆"的主要来源），5 分钟级归还在静息期完成。
     let mut last_purge_ms = crate::platform::paths::monotonic_ms();
     let mut last_anchor_check_ms = crate::platform::paths::monotonic_ms();
+    let mut last_probe_ms = crate::platform::paths::monotonic_ms();
+    install_host_signal_probe();
     spawn_host_stall_watchdog(watchdog_conn);
     if let Some(heartbeat_conn) = watchdog_conn {
         spawn_host_heartbeat_writer(heartbeat_conn);
     }
     loop {
         if background.guard.is_finished() {
+            let mount_present = std::fs::read_to_string("/proc/self/mountinfo")
+                .map(|text| text.lines().any(|line| line.contains(host_mount_point)))
+                .unwrap_or(false);
+            let waiting = watchdog_conn.and_then(|conn| {
+                std::fs::read_to_string(format!("/sys/fs/fuse/connections/{conn}/waiting")).ok()
+            });
+            log::warn!(
+                "fuse host session end reason=guard_finished pid={} mp={} mount_present={} waiting={:?}",
+                std::process::id(),
+                host_mount_point,
+                mount_present,
+                waiting
+            );
+            forensics_log(&format!(
+                "fuse host session end pid={} mount_present={} waiting={:?}",
+                std::process::id(),
+                mount_present,
+                waiting
+            ));
+            return finish_background_session(background, host_mount_point, false, Some(&identity));
+        }
+        let sig = HOST_TERM_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+        if sig != 0 {
+            log::warn!(
+                "fuse host received signal pid={} sig={}",
+                std::process::id(),
+                sig
+            );
+            forensics_log(&format!(
+                "fuse host received signal pid={} sig={}",
+                std::process::id(),
+                sig
+            ));
             return finish_background_session(background, host_mount_point, false, Some(&identity));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1108,7 +1143,26 @@ pub fn mount_host_fuse(
             last_purge_ms = now_ms;
             crate::platform::allocator::release_free_pages();
         }
-        // 锚点存在性周期校验（10 秒，降低窗口期）：数据面 real_root 现在依赖锚点 bind，
+        // 诊断：每 10 秒把宿主 RSS 与线程数写入 stall-forensics，用于判断宿主退出前是否
+        // 出现内存/线程异常（正常路径不产生 running.log 噪声）。
+        if now_ms.saturating_sub(last_probe_ms) >= 10_000 {
+            last_probe_ms = now_ms;
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let rss = status
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap_or("VmRSS: ?");
+            let threads = status
+                .lines()
+                .find(|line| line.starts_with("Threads:"))
+                .unwrap_or("Threads: ?");
+            forensics_log(&format!(
+                "fuse host alive pid={} {} {}",
+                std::process::id(),
+                rss.trim(),
+                threads.trim()
+            ));
+        } // 锚点存在性周期校验（10 秒，降低窗口期）：数据面 real_root 现在依赖锚点 bind，
         // 而 gen4 冻结现场实证 bind 会静默消失（mount info 无条目；根因为 MS_BIND 复制
         // 共享传播组成员时新 bind 加入同一 peer 组、系统侧 umount 传播连带卸载，已在
         // establish 内 MS_PRIVATE 私有化根治）。周期校验作为最后防线，捕获 MS_PRIVATE
@@ -1245,6 +1299,24 @@ fn host_heartbeat_loop(connection: i32) {
 /// 线程阻塞在 eventfd 的 epoll 上：worker 每完成一个请求写一次 eventfd，空闲时
 /// 看门狗睡在 epoll_wait（零 CPU），仅在请求停止完成时由超时路径唤醒——发现延迟
 /// 是「无完成时长」本身，不是轮询间隔。eventfd 由本函数创建并注入 vendor 会话。
+/// 诊断用：宿主子进程收到的终止类信号。处理函数只写原子变量，主循环负责落盘。
+static HOST_TERM_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn host_signal_probe(sig: libc::c_int) {
+    HOST_TERM_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 诊断用：接管 SIGTERM/SIGINT/SIGHUP/SIGQUIT，记录信号后走既有会话结束路径。
+fn install_host_signal_probe() {
+    // SAFETY: signal(2) 只安装向原子变量写入信号号的处理器；SIGKILL/SIGSTOP 由内核忽略。
+    unsafe {
+        libc::signal(libc::SIGTERM, host_signal_probe as libc::sighandler_t);
+        libc::signal(libc::SIGINT, host_signal_probe as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, host_signal_probe as libc::sighandler_t);
+        libc::signal(libc::SIGQUIT, host_signal_probe as libc::sighandler_t);
+    }
+}
+
 fn spawn_host_stall_watchdog(connection: Option<i32>) {
     let Some(connection) = connection else {
         return;

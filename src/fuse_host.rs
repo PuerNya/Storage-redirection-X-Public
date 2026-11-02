@@ -108,7 +108,23 @@ fn process_is_zombie(pid: i32) -> bool {
 fn reap_exited_host_child(pid: libc::pid_t) {
     let mut status: libc::c_int = 0;
     // SAFETY: pid 是本模块 fork 出的子进程；WNOHANG 只在它已退出时回收，不会阻塞。
-    unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    // SAFETY: status 由内核在 waitpid 返回该 pid 后完整写入，诊断日志只读取已初始化字段行。
+    let ret = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    if ret == pid {
+        let (code, signal) = if libc::WIFEXITED(status) {
+            (libc::WEXITSTATUS(status), 0)
+        } else if libc::WIFSIGNALED(status) {
+            (-1, libc::WTERMSIG(status))
+        } else {
+            (-2, 0)
+        };
+        log::warn!(
+            "fuse host child reaped pid={} exit_code={} signal={}",
+            pid,
+            code,
+            signal
+        );
+    }
 }
 
 fn host_is_dead(host: &FuseHost) -> bool {
@@ -1645,6 +1661,32 @@ impl Drop for UniqueFd {
     }
 }
 
+/// 诊断：宿主换代前把上一代的 stage 文件归档，保留每一代退出前的最后阶段。
+fn archive_host_stage_history() {
+    let Ok(old) = std::fs::read_to_string(FUSE_HOST_STAGE_PATH) else {
+        return;
+    };
+    if old.trim().is_empty() {
+        return;
+    }
+    let history = format!("{}.history", FUSE_HOST_STAGE_PATH);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history)
+    else {
+        return;
+    };
+    let _ = std::io::Write::write_fmt(
+        &mut file,
+        format_args!("# {now} stage-before-respawn\n{old}\n"),
+    );
+}
+
 /// 清空阶段文件：每次尝试只保留本轮痕迹，避免多轮重试互相覆盖后无法判断当轮结果。
 fn reset_host_stage() {
     let _ = std::fs::write(FUSE_HOST_STAGE_PATH, b"");
@@ -1735,6 +1777,7 @@ pub fn spawn_fuse_host() -> Option<FuseHost> {
         return None;
     }
 
+    archive_host_stage_history();
     reset_host_stage();
     crate::logging::prepare_for_fork();
     // SAFETY: fork 前已完成日志/信号准备，匹配现有 daemon 挂载的 fork 模式。
