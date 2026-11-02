@@ -31,6 +31,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static MONITOR_HOOK_PROCESS_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// 诊断：MediaProvider pre-specialize 阶段计时起点；0 表示非 MediaProvider。
+static MEDIA_PRE_STARTED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn media_pre_log(stage: &str) {
+    let start = MEDIA_PRE_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if start == 0 {
+        return;
+    }
+    log::warn!(
+        "media pre {} ms={}",
+        stage,
+        monotonic_ms().saturating_sub(start)
+    );
+}
+
 impl RuntimeFlow {
     // 请求 Zygisk 在 postAppSpecialize 后卸载模块 .so
     pub(super) fn request_dlclose(&self) {
@@ -118,7 +133,9 @@ impl RuntimeFlow {
         // 但从更早的分支返回了。两者需要相反的修复，而 logcat 采集晚于
         // MediaProvider specialize、writer 进程又不写模块日志文件，事后无从区分。
         if policy::is_media_provider_package(&self.package_name) {
+            MEDIA_PRE_STARTED_MS.store(monotonic_ms(), std::sync::atomic::Ordering::Relaxed);
             record_media_hook_install_state("specialize_enter");
+            log::warn!("media pre enter pid={} uid={}", self.app_pid, self.app_uid);
         }
 
         log::debug!(
@@ -314,6 +331,7 @@ impl RuntimeFlow {
             self.should_keep_module_loaded = true;
         }
         perf_stages.writer_context_ms = monotonic_ms().saturating_sub(writer_context_started_ms);
+        media_pre_log("writer_done");
 
         let enabled_scan_started_ms = monotonic_ms();
         let has_enabled_apps = if is_system_writer {
@@ -373,8 +391,10 @@ impl RuntimeFlow {
         if should_install_media_provider_java_hook {
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
+            media_pre_log("java_hook_start");
             crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
             install_java_hook(self.env);
+            media_pre_log("java_hook_done");
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
             && (self.is_system_writer_hook_redirect || self.should_monitor)
@@ -394,6 +414,7 @@ impl RuntimeFlow {
             self.should_monitor
         );
 
+        media_pre_log("route_start");
         let route_config_started_ms = monotonic_ms();
         let (
             allowed_real_paths,
