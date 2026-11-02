@@ -175,13 +175,9 @@ unsafe extern "C" fn pre_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *mut AppSpecializeArgs,
 ) {
-    if impl_ptr.is_null() {
-        return;
-    }
-    let flow_lock = &*(impl_ptr as *const Mutex<RuntimeFlow>);
-    if let Ok(mut flow) = flow_lock.lock() {
-        flow.pre_app_specialize(args);
-    }
+    // 诊断：仅注册模块但不执行 specialize 前流程，用于区分问题在注册/加载阶段
+    // 还是 pre/post specialize 的挂载与 hook 安装阶段。
+    let _ = (impl_ptr, args);
 }
 
 // specialize 后阶段：等挂载就绪并完成 hook 安装
@@ -189,13 +185,8 @@ unsafe extern "C" fn post_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *const AppSpecializeArgs,
 ) {
-    if impl_ptr.is_null() {
-        return;
-    }
-    let flow_lock = &*(impl_ptr as *const Mutex<RuntimeFlow>);
-    if let Ok(mut flow) = flow_lock.lock() {
-        flow.post_app_specialize(args);
-    }
+    // 诊断：post specialize 同样不执行。
+    let _ = (impl_ptr, args);
 }
 
 // system_server specialize 前：请求 Zygisk dlclose 自身，避免常驻
