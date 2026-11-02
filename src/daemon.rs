@@ -1767,7 +1767,7 @@ fn build_request(
         storage_backend_mode: if is_monitor_only {
             crate::config::StorageBackendMode::Fuse
         } else {
-            snapshot.storage_backend_mode
+            crate::fuse_host::effective_backend_mode(snapshot.storage_backend_mode)
         },
         is_file_monitor_enabled: snapshot.is_file_monitor_enabled,
         config_version,
