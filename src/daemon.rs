@@ -18,7 +18,7 @@ use std::fs::{self as std_fs, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,6 +64,49 @@ static UNINTERRUPTIBLE_SKIP_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 已死亡的旧 FUSE 连接，必须清空宿主策略预登记指纹表，让本轮预登记全量重跑并
 /// 重新绑定新连接。集合稳定时不清空，配合预登记指纹实现稳态零 fork。
 static LAST_MEDIA_PROVIDER_PIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// MediaProvider 进程换代计数窗口：60 秒内换代达到 4 次视为 attach 超时循环。
+const MEDIA_PROVIDER_CHURN_WINDOW_MS: i64 = 60_000;
+const MEDIA_PROVIDER_CHURN_LIMIT: u32 = 4;
+const MEDIA_JAVA_HOOK_DISABLED_PROP: &str = "persist.srx.media_java_hook_disabled";
+static MEDIA_PROVIDER_CHURN_LAST_MS: AtomicI64 = AtomicI64::new(0);
+static MEDIA_PROVIDER_CHURN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// MediaProvider 换代风暴检测：连续 attach 超时会让 pid 每 10 秒变化一次，
+/// 累计到阈值后持久关闭 MediaProvider Java hook（下次开机生效），避免系统存储
+/// 进入 vold abort 循环；fuse fix/SFA 的 native 路径不受影响。
+fn note_media_provider_churn(current_count: usize) {
+    let now = crate::platform::paths::monotonic_ms();
+    let last = MEDIA_PROVIDER_CHURN_LAST_MS.swap(now, Ordering::AcqRel);
+    let count = if last != 0 && now.saturating_sub(last) <= MEDIA_PROVIDER_CHURN_WINDOW_MS {
+        MEDIA_PROVIDER_CHURN_COUNT.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        MEDIA_PROVIDER_CHURN_COUNT.store(1, Ordering::Release);
+        1
+    };
+    if count < MEDIA_PROVIDER_CHURN_LIMIT {
+        return;
+    }
+    if crate::platform::system_property_get(MEDIA_JAVA_HOOK_DISABLED_PROP).as_deref() == Some("1") {
+        return;
+    }
+    let status = std::process::Command::new("/system/bin/setprop")
+        .arg(MEDIA_JAVA_HOOK_DISABLED_PROP)
+        .arg("1")
+        .status();
+    match status {
+        Ok(status) if status.success() => log::warn!(
+            "media provider churn detected count={} alive={} java_hook_disabled=1 next_boot=true",
+            count,
+            current_count
+        ),
+        _ => log::warn!(
+            "media provider churn detected count={} alive={} java_hook_disable_failed",
+            count,
+            current_count
+        ),
+    }
+}
 
 /// 开机全量预登记是否已在 MediaProvider 就绪后补登记过一次。
 ///
@@ -1352,6 +1395,7 @@ fn reconcile_running_apps(
                 *last_media_pids = media_pids;
                 drop(last_media_pids);
                 invalidate_pre_registered_host_policies();
+                note_media_provider_churn(media_pids.len());
             }
             !media_processes.is_empty()
         } else {
@@ -1767,7 +1811,7 @@ fn build_request(
         storage_backend_mode: if is_monitor_only {
             crate::config::StorageBackendMode::Fuse
         } else {
-            snapshot.storage_backend_mode
+            crate::fuse_host::effective_backend_mode(snapshot.storage_backend_mode)
         },
         is_file_monitor_enabled: snapshot.is_file_monitor_enabled,
         config_version,

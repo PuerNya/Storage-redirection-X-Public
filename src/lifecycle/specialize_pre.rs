@@ -30,6 +30,8 @@ use crate::zygisk::{abi, jni};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static MONITOR_HOOK_PROCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+/// MediaProvider Java hook 兼容性回退开关；由 daemon 在检测到 attach 超时换代后置位。
+const MEDIA_JAVA_HOOK_DISABLED_PROP: &str = "persist.srx.media_java_hook_disabled";
 
 impl RuntimeFlow {
     // 请求 Zygisk 在 postAppSpecialize 后卸载模块 .so
@@ -374,7 +376,17 @@ impl RuntimeFlow {
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
             crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
-            install_java_hook(self.env);
+            // 兼容性回退：daemon 检测到 MediaProvider 反复 attach 超时后置位该属性，
+            // 后续开机不再在 MediaProvider 内安装 Java hook，避免其阻塞系统 provider
+            // 启动；fuse fix 与 SFA 归因走 native 路径，不受此开关影响。
+            let java_hook_disabled =
+                crate::platform::system_property_get(MEDIA_JAVA_HOOK_DISABLED_PROP).as_deref()
+                    == Some("1");
+            if java_hook_disabled {
+                log::warn!("media java hook skipped by compatibility fallback");
+            } else {
+                install_java_hook(self.env);
+            }
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
             && (self.is_system_writer_hook_redirect || self.should_monitor)
