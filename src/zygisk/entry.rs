@@ -175,6 +175,9 @@ unsafe extern "C" fn pre_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *mut AppSpecializeArgs,
 ) {
+    if crate::platform::system_property_get("persist.srx.diag.skip_pre").as_deref() == Some("1") {
+        return;
+    }
     if impl_ptr.is_null() {
         return;
     }
@@ -189,6 +192,9 @@ unsafe extern "C" fn post_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *const AppSpecializeArgs,
 ) {
+    if crate::platform::system_property_get("persist.srx.diag.skip_post").as_deref() == Some("1") {
+        return;
+    }
     if impl_ptr.is_null() {
         return;
     }
