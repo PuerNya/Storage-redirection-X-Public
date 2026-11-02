@@ -175,6 +175,13 @@ unsafe extern "C" fn pre_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *mut AppSpecializeArgs,
 ) {
+    // 诊断构建：属性置位时跳过 specialize 前后流程，用于判断卡点在模块加载
+    // 还是 pre/post specialize 阶段。仅诊断分支。
+    if crate::platform::system_property_get("persist.srx.diag.skip_specialize").as_deref()
+        == Some("1")
+    {
+        return;
+    }
     if impl_ptr.is_null() {
         return;
     }
@@ -189,6 +196,11 @@ unsafe extern "C" fn post_app_specialize(
     impl_ptr: *mut std::ffi::c_void,
     args: *const AppSpecializeArgs,
 ) {
+    if crate::platform::system_property_get("persist.srx.diag.skip_specialize").as_deref()
+        == Some("1")
+    {
+        return;
+    }
     if impl_ptr.is_null() {
         return;
     }
