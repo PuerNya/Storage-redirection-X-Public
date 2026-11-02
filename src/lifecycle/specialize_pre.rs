@@ -479,6 +479,7 @@ impl RuntimeFlow {
             );
         }
         // specialize_post 的挂载落定判据要按模式分支，这里把结论带过去。
+        record_media_hook_install_state("pre_router_done");
         self.is_mapping_mode_only = is_mapping_mode_only;
         perf_stages.route_ms = if self.should_redirect {
             monotonic_ms().saturating_sub(route_config_started_ms)
@@ -530,6 +531,7 @@ impl RuntimeFlow {
         }
 
         if self.is_system_writer_hook_redirect {
+            record_media_hook_install_state("pre_writer_hook_return");
             log::info!("writer skip companion mount (per-caller hook)");
             self.log_specialize_exit(
                 "writer_hook",
@@ -552,6 +554,7 @@ impl RuntimeFlow {
             is_mapping_mode_only
         );
 
+        record_media_hook_install_state("pre_payload_start");
         let payload_started_ms = monotonic_ms();
         let payload = build_companion_request_payload(&CompanionMountRequest {
             pid: self.app_pid,
@@ -573,6 +576,7 @@ impl RuntimeFlow {
         });
         perf_stages.payload_ms = monotonic_ms().saturating_sub(payload_started_ms);
         perf_stages.payload_bytes = payload.len();
+        record_media_hook_install_state("pre_payload_done");
         if payload.is_empty() {
             self.log_specialize_exit(
                 "empty_payload",
@@ -593,9 +597,11 @@ impl RuntimeFlow {
 
         // 预挂载路径与兜底路径的发送动作完全一致，只有额外日志和退出原因不同
         let is_pre_mount_request = !is_system_writer && !is_shared_uid_writer && !is_monitor_bridge;
+        record_media_hook_install_state("pre_send_start");
         let send_started_ms = monotonic_ms();
         self.is_mount_request_sent = send_companion_request_payload(self.api.as_ref(), &payload);
         perf_stages.send_ms = monotonic_ms().saturating_sub(send_started_ms);
+        record_media_hook_install_state("pre_send_done");
         if is_pre_mount_request {
             log::info!(
                 "mount request sent pre pkg={} sent={} payload={} map_only={}",
