@@ -185,6 +185,7 @@ impl RuntimeFlow {
         needs_writer_config_dir: bool,
         perf_stages: &mut SpecializePerfStages,
     ) -> Option<Option<String>> {
+        record_media_hook_install_state("pre_config_done");
         let config = SettingsHub::instance();
         let writer_config_dir = if needs_writer_config_dir {
             self.open_module_dir_fd_for_writer();
@@ -268,6 +269,7 @@ impl RuntimeFlow {
         ) else {
             return;
         };
+        record_media_hook_install_state("pre_config_done");
         let config = SettingsHub::instance();
 
         // 隔离进程无 FUSE 挂载和存储权限，跳过重定向
@@ -314,6 +316,7 @@ impl RuntimeFlow {
             self.should_keep_module_loaded = true;
         }
         perf_stages.writer_context_ms = monotonic_ms().saturating_sub(writer_context_started_ms);
+        record_media_hook_install_state("pre_writer_done");
 
         let enabled_scan_started_ms = monotonic_ms();
         let has_enabled_apps = if is_system_writer {
@@ -373,8 +376,10 @@ impl RuntimeFlow {
         if should_install_media_provider_java_hook {
             // Java hook 会在零配置启动时预装并跨配置热加载继续工作。仅登记
             // 系统写入进程身份，使后续回调能刷新监控状态，不在这里安装 PLT hook。
+            record_media_hook_install_state("pre_java_start");
             crate::hook::InterceptHub::instance().register_runtime_identity(&self.package_name);
             install_java_hook(self.env);
+            record_media_hook_install_state("pre_java_done");
         } else if (writer_context.is_system_writer || writer_context.is_monitor_bridge)
             && !writer_context.is_media_provider
             && (self.is_system_writer_hook_redirect || self.should_monitor)
@@ -394,6 +399,7 @@ impl RuntimeFlow {
             self.should_monitor
         );
 
+        record_media_hook_install_state("pre_route_start");
         let route_config_started_ms = monotonic_ms();
         let (
             allowed_real_paths,
