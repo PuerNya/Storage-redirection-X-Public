@@ -26,6 +26,10 @@ const MOUNT_SETTLE_POLLS: u32 = 4;
 impl RuntimeFlow {
     pub fn post_app_specialize(&mut self, _args: *const abi::AppSpecializeArgs) {
         let perf_started_ms = monotonic_ms();
+        let is_media_provider = policy::is_media_provider_package(&self.package_name);
+        if is_media_provider {
+            log::warn!("media post enter pid={}", self.app_pid);
+        }
         // 历史挂载状态标记的清理放在这里：post 对每个被注入的进程都会被调用，而 pre 存在
         // 多条会直接返回的分支（无有效配置的 fast bypass 等），放在 pre 里对那类应用永远清不到，
         // 正是它们的遗留标记会一直累积。这里早于本函数的所有提前返回，也早于 dlclose。
@@ -79,6 +83,12 @@ impl RuntimeFlow {
                     self.is_mapping_mode_only,
                     &mut self.is_mount_applied,
                 );
+                if is_media_provider {
+                    log::warn!(
+                        "media post mount wait done applied={}",
+                        self.is_mount_applied
+                    );
+                }
                 mount_wait_ms = monotonic_ms().saturating_sub(mount_started_ms);
             }
         } else if self.should_redirect && self.is_system_writer_hook_redirect {
