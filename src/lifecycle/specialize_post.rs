@@ -40,6 +40,11 @@ impl RuntimeFlow {
         if policy::is_media_provider_package(&self.package_name) {
             java_hook::start_hot_reload_after_specialize();
         }
+        if self.media_java_hook_pending {
+            self.media_java_hook_pending = false;
+            super::specialize_pre::install_java_hook(self.env);
+            log::warn!("media java hook installed in post");
+        }
         if self.should_skip_post_work {
             log_post_perf(self, "skip", 0, 0, 0, perf_started_ms);
             return;

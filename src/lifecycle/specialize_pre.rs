@@ -384,6 +384,11 @@ impl RuntimeFlow {
                     == Some("1");
             if java_hook_disabled {
                 log::warn!("media java hook skipped by compatibility fallback");
+            } else if policy::is_media_provider_package(&self.package_name) {
+                // 候选修复：MediaProvider 的 Java hook 不在 pre 安装，推迟到 post，
+                // 避免阻塞 pre 返回后的 specialize 继续执行。
+                self.media_java_hook_pending = true;
+                record_media_hook_install_state("pre_java_deferred");
             } else {
                 install_java_hook(self.env);
             }
@@ -796,7 +801,7 @@ pub(crate) fn java_hook_disabled() -> bool {
         .exists()
 }
 
-fn install_java_hook(env: *mut jni_sys::JNIEnv) {
+pub(super) fn install_java_hook(env: *mut jni_sys::JNIEnv) {
     if java_hook_disabled() {
         log::info!("java hook skip: disabled by diagnostic marker");
         record_media_hook_install_state("java_hook_disabled");
