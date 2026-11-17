@@ -130,6 +130,7 @@ pub fn has_healthy_mount_state(request: &MountRequest) -> bool {
         MountStateCheck::StateMissing
             | MountStateCheck::FuseChildDead
             | MountStateCheck::TargetsMissing
+            | MountStateCheck::OwnershipChanged
             | MountStateCheck::BackendUnresponsive
     )
 }
@@ -211,6 +212,8 @@ enum MountStateCheck {
     FuseChildDead,
     /// 状态记录的挂载目标已不在应用 namespace。
     TargetsMissing,
+    /// 进程、命名空间或已登记入口的栈顶身份发生变化。
+    OwnershipChanged,
     /// 后端挂载点探测为断连。
     BackendUnresponsive,
     /// 状态健康但记录的配置指纹与当前不一致。
@@ -292,6 +295,12 @@ fn has_mount_state_internal(request: &MountRequest, check_mount_targets: bool) -
     if check_mount_targets {
         if !targets.is_empty() && !mount_targets_present(request.pid, &targets, request) {
             return MountStateCheck::TargetsMissing;
+        }
+        if !targets.is_empty()
+            && !mount_identity::load(&request.package_name, request.pid)
+                .is_some_and(|ledger| mount_identity::recorded_mounts_current(&ledger))
+        {
+            return MountStateCheck::OwnershipChanged;
         }
         if !backend_mount_targets_responsive(request) {
             return MountStateCheck::BackendUnresponsive;
@@ -435,9 +444,23 @@ pub fn supervise_mount_request(
     let poisoned = ledger.is_poisoned();
     let mut actions = Vec::new();
     let mut worst_health = EndpointHealth::Healthy;
+    let user_id = crate::platform::user_id_from_uid(request.uid);
+    let system_view = mount_identity::system_storage_view_anchor(user_id);
 
     for mount in &ledger.mounts {
-        let live = mount_identity::topmost_live_mount(request.pid, &mount.mount_point);
+        let live = match mount_identity::try_visible_mount_at(request.pid, &mount.mount_point) {
+            Ok(live) => live,
+            Err(error) => {
+                log::warn!(
+                    "daemon mount observation failed pid={} target={} err={}",
+                    request.pid,
+                    mount.mount_point,
+                    error
+                );
+                actions.push(RecoveryAction::SkipSuperseded);
+                continue;
+            }
+        };
         let verdict = mount_identity::classify_mount(
             &ledger,
             &mount.mount_point,
@@ -445,11 +468,23 @@ pub fn supervise_mount_request(
             current_namespace,
             target_is_current,
         );
-        let health = fuse_supervisor::probe_endpoint(request.pid, &mount.mount_point);
+        // 归属已变时只按身份决策，避免访问其它服务的端点而阻塞监督循环。
+        let health = if matches!(
+            verdict,
+            MountVerdict::Superseded(_) | MountVerdict::StaleNamespace
+        ) {
+            EndpointHealth::Unprobed(0)
+        } else {
+            fuse_supervisor::probe_endpoint(request.pid, &mount.mount_point)
+        };
         if health.is_dead_connection() {
             worst_health = health;
         }
-        actions.push(fuse_supervisor::plan_recovery(&verdict, health, poisoned));
+        let system_replacement = matches!(&verdict, MountVerdict::Superseded(live) if mount_identity::is_system_storage_view(
+            &mount.mount_point, live, user_id, system_view.as_ref()
+        ));
+        let action = fuse_supervisor::plan_recovery(&verdict, health, poisoned, system_replacement);
+        actions.push(action);
     }
 
     if actions.is_empty() {
@@ -480,6 +515,7 @@ pub fn supervise_mount_request(
             &verdict,
             EndpointHealth::Missing,
             poisoned,
+            false,
         ));
     }
 
@@ -961,11 +997,13 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
                 request.pid,
                 request.package_name
             );
-            let _ = send_mount_result(sock, -1);
-            // SAFETY: sock 来自本进程已连接的 socketpair，且此处是唯一关闭路径。
-            unsafe { close(sock) };
-            return false;
         }
+    }
+    if request.operation == MountOperation::Reload && !cleanup.is_cleared() {
+        let _ = send_mount_result(sock, -1);
+        // SAFETY: sock 来自本进程已连接的 socketpair，且此处是唯一关闭路径。
+        unsafe { close(sock) };
+        return false;
     }
     clear_previous_allowed_real_backend_mounts(request);
 
@@ -1327,8 +1365,11 @@ fn preattach_shared_host(
     // 叠层，但仍要按宿主挂载记账——否则状态文件里没有这条目标，下一轮清理会漏摘，
     // 挂载层没有任何归属判据。判据必须是「当前会话」：旧代际的层已经失效，仍需重新挂。
     let view = crate::fuse_host::HostSessionView::from(host.as_ref());
-    if crate::fuse_session::storage_view_top_dev(&attach_root).as_deref() == Some(view.dev.as_str())
-    {
+    if crate::fuse_host::host_storage_aliases_current(
+        &attach_root,
+        crate::platform::user_id_from_uid(request.uid),
+        &view.dev,
+    ) {
         log::info!(
             "daemon shared host preattach skipped, current host layer already serving pid={} pkg={} target={}",
             request.pid,
@@ -1711,16 +1752,18 @@ impl ClearOutcome {
 /// MediaProvider 的 FUSE）或本模块的新会话接管。这里先按账本校验归属再摘除，只有确认
 /// 目标上没有本模块的挂载层时才返回 [`ClearOutcome::Cleared`]。
 ///
-/// 状态文件删除失败只记告警、不影响结论：挂载层已经确认清除，残留的状态文件只会让下一轮
-/// 多做一次已幂等的归属校验，不会造成叠加。
+/// 状态文件删除失败仍返回未确认，保留账本供下一轮校验，不能继续注入。
 fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearOutcome {
     let state_path = plan.state_path.as_str();
     let fuse_children = read_fuse_children(state_path);
     let mut targets = read_mount_targets(state_path);
     // 短路场景可能没有 state 文件，但历史版本已经写过 mount_identity；
     // 仅依赖 state 会让这些挂载层永久漏清理，之后每轮 supervise 都可能继续叠挂。
-    // 先把账本登记的目标加入候选，实际摘除仍由 mount_id/source 归属校验保护。
-    let ledger = mount_identity::load(&request.package_name, request.pid);
+    // 先把账本登记的目标加入候选，实际摘除仍由 mount_id/dev 归属校验保护。
+    let ledger = mount_identity::load(&request.package_name, request.pid).filter(|ledger| {
+        ledger.target_is_current()
+            && mount_identity::namespace_identity(0) == Some(ledger.namespace)
+    });
     if let Some(ledger) = ledger.as_ref() {
         targets.extend(ledger.mounts.iter().map(|mount| mount.mount_point.clone()));
     }
@@ -1743,8 +1786,11 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
         // 残留都可能在目标上留下本模块的层，而这些层没有记录，后续清理不会再被
         // 加入候选。这里按模块挂载来源做一次兜底识别与摘除，只处理判定为本应用
         // 重定向的层；仍有无法摘除的层时保守返回 Unverified，不进入挂载。
-        let leftovers =
-            crate::module_mount_source::app_redirect_mounts_in(0, &request.package_name);
+        let Some(leftovers) =
+            crate::module_mount_source::app_redirect_mounts_in(0, &request.package_name)
+        else {
+            return ClearOutcome::Unverified;
+        };
         let mut leftover_cleared = true;
         for mount in leftovers.iter().rev() {
             let Ok(c_target) = CString::new(mount.mount_point.as_str()) else {
@@ -1782,7 +1828,11 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
         {
             let _ = mount_identity::remove(&request.package_name, request.pid);
         }
-        return if state_removed && leftover_cleared {
+        // 摘掉栈顶可能露出旧层；本轮未确认清空时停止注入，留给下一轮继续核验。
+        let no_leftovers =
+            crate::module_mount_source::app_redirect_mounts_in(0, &request.package_name)
+                .is_some_and(|mounts| mounts.is_empty());
+        return if state_removed && leftover_cleared && no_leftovers {
             ClearOutcome::Cleared
         } else {
             ClearOutcome::Unverified
@@ -1805,16 +1855,8 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             );
             continue;
         }
-        // path_mappings 形态切换时旧 ledger 可能只登记上一层 mount_id；若继续用
-        // superseded 保护，会把新层误判为“更新的其它会话”而拒绝摘除，旧根与新映射
-        // 叠加后应用同时命中请求路径和目标。此时按当前挂载形态重新判定归属，清理
-        // 所有模块层；系统自有 app-private FUSE 层仍由形态判定保留。
-        let cleanup_ledger = request
-            .path_mappings
-            .is_empty()
-            .then_some(ledger.as_ref())
-            .flatten();
-        if !clear_mount_target_stack_verified(target, cleanup_ledger) {
+        // 映射切换也保留精确身份，系统 FUSE 上的私有 bind 不能仅靠超级块辨认。
+        if !clear_mount_target_stack_verified(target, ledger.as_ref(), request.uid) {
             outcome = ClearOutcome::Unverified;
         }
     }
@@ -2007,25 +2049,21 @@ fn clear_mount_target_stack(target: &str) -> bool {
 /// 目标（`/data/media` 下可能残留系统 MediaProvider 的 FUSE 子挂载，必须摘掉才能重新
 /// 绑定可用后端），本函数只用于状态文件里记录的、本模块自己挂上去的目标。
 ///
-/// 归属判据由 [`mount_identity::is_module_redirect_mount`] 给出，它同时看挂载源与 `root`：
-/// 只按挂载源判断是不够的——bind 会继承底层文件系统的源，真机上本模块每一层的 source 都是
-/// MediaProvider FUSE 的 `/dev/fuse`，因此**每一层都会被误判成外部挂载而拒绝摘除**，重挂
-/// 只能在旧层之上叠加（真机表现为同一路径 4 层、应用读到被压在最上面的沙箱层）。
-///
-/// 覆盖范围必须限于本模块自己挂的目标，不能扩到 `/data/media` 后端目标：那里的层虽然可能
-/// 也带沙箱 `root`，但摘除后要按 MediaProvider 语义重建，属 [`clear_mount_target_stack`] 的
-/// 职责。这里的 `target` 全部来自状态文件的 `target=` 记录，即本模块挂过的路径。
-///
-/// 返回 true 表示该目标上已确认没有本模块的挂载层。
-fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>) -> bool {
+/// 精确账本身份或已知模块 FUSE 超级块才允许摘除；系统视图保留给接入事务备份后替换。
+/// 未知层返回 false，调用方必须停止注入。挂载 ID 只用于相等比较，不表示挂载时间。
+fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>, uid: i32) -> bool {
     let mut passes = 0usize;
     let normalized_target = paths::normalize_syntax(target);
-    // 已知会话 dev 只需算一次：清理循环每一层都要判归属，逐层重读账本目录会在
-    // 多应用批次里退化成 O(层数 x 账本数) 的磁盘读。
+    // 一轮清理复用同份会话历史，避免每摘一层都重读文件。
     let known_devs = crate::mount_ledger::known_module_fuse_devs();
+    let user_id = crate::platform::user_id_from_uid(uid);
+    let system_view = mount_identity::system_storage_view_anchor(user_id);
 
     loop {
-        let Some(live) = mount_identity::topmost_live_mount(0, target) else {
+        let Ok(live) = mount_identity::try_topmost_live_mount(0, target) else {
+            return false;
+        };
+        let Some(live) = live else {
             if passes > 1 {
                 log::info!(
                     "daemon unmount stack cleared target={} passes={}",
@@ -2035,83 +2073,26 @@ fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>)
             }
             return true;
         };
-        if let Some(ledger) = ledger {
-            // 账本成员判定优先于形态启发式：本模块登记过的 mount_id 一定是自己的层。
-            // private-dir alias bind 的 root 形态与系统挂载完全同形（都止于
-            // Android/{data,media,obb}/<pkg>），只靠 is_module_redirect_mount 会把它
-            // 误判成系统挂载而拒绝摘除，cleanup 永不完整、重挂循环不停。
-            let recorded_ids: Vec<u64> = ledger
-                .mounts
-                .iter()
-                .filter(|mount| mount.mount_point == normalized_target)
-                .map(|mount| mount.mount_id)
-                .collect();
-            if let Some(max_recorded) = recorded_ids.iter().max() {
-                if recorded_ids.contains(&live.mount_id) {
-                    // 账本在册：本模块的层，直接进入摘除。
-                } else if live.mount_id > *max_recorded {
-                    // 比账本记录更新：本模块的新会话已经接管这个挂载点，摘掉它会把
-                    // 正在服务的挂载打掉。
-                    log::warn!(
-                        "daemon unmount skipped superseded mount target={} mount_id={} recorded={} ledger_generation={}",
-                        target,
-                        live.mount_id,
-                        max_recorded,
-                        ledger.generation
-                    );
-                    return false;
-                }
-                // 比账本记录更旧且不在册：落到下方形态判定（可能是系统挂载）。
-            }
+        let recorded = |layer: &mount_identity::LiveMount| {
+            ledger.is_some_and(|ledger| {
+                ledger.mounts.iter().any(|mount| {
+                    mount.mount_point == normalized_target
+                        && mount.mount_id == layer.mount_id
+                        && mount.dev == layer.dev
+                })
+            })
+        };
+        let system_layer =
+            mount_identity::is_system_storage_view(target, &live, user_id, system_view.as_ref());
+        if system_layer && !recorded(&live) {
+            // 系统栈顶交给宿主接入事务备份后替换，清理阶段不提前破坏回滚基线。
+            return true;
         }
-        // 模块自己的 fail-closed 屏障（companion 在接入前挂的 tmpfs）：source=none、
-        // root=/、fs=tmpfs。存储子路径上不存在其它裸 tmpfs 形态，与系统挂载无重叠。
-        // 它必须随 cleanup 一并摘除：留在原地会让 disable 后的应用永远看到空只读目录。
-        let is_module_barrier = live.fs_type == "tmpfs" && live.root == "/";
-        // 超级块归属：源原生化成 `/dev/fuse` 之后，`source`/`root` 形态对本模块的层与系统
-        // MediaProvider 的层完全同形，`is_module_redirect_mount` 的四条判据全部落空。账本
-        // 里记录了每层落盘时的 `dev`，同 dev 即"出自本实例的会话"，这是唯一还能用的内核事实。
-        //
-        // 不能只认**本 pid 账本**里的 dev：共享宿主会话的层由 companion 在应用命名空间里挂，
-        // 账本可能还没落盘、或已被上一轮 generation 重写而不含这一层；宿主换代后旧层也会
-        // 残留在活着的应用命名空间里。因此以「本账本登记的 dev ∪ 全模块已知会话 dev」判定，
-        // 后者包含当前宿主会话与历史会话（见 `known_module_fuse_devs`）。
-        //
-        // 没有这一条时真机现象（2026-11-02）：daemon 把本模块自己的层判成 foreign → 跳过摘除
-        // → `cleanup incomplete` → 重挂请求仍回 `completed`，但运行中应用的挂载栈一层未换，
-        // 表现为**改配置不生效、必须杀进程**。
-        // 只有 FUSE 超级块才谈得上"同 dev 即同会话"：私有目录 alias bind 之类的层继承
-        // 后端 f2fs 的超级块，dev 相同并不能说明它出自本模块（系统自己的同盘 bind 也是这个
-        // dev），按 dev 认领会误摘系统挂载。
+        // 系统超级块已从历史集合排除；其上的私有目录 bind 必须逐个匹配账本身份。
         let is_owned_by_dev = !live.dev.is_empty()
             && live.fs_type.starts_with("fuse")
-            && (known_devs.contains(&live.dev)
-                || ledger
-                    .is_some_and(|ledger| ledger.mounts.iter().any(|mount| mount.dev == live.dev)));
-        if !is_module_barrier
-            && !is_owned_by_dev
-            && !mount_identity::is_module_redirect_mount(
-                &live.source,
-                &live.root,
-                target,
-                ledger.map_or("", |ledger| ledger.package_name.as_str()),
-            )
-        {
-            // 系统自己的应用专属 FUSE 视图（root 恰止于 Android/{data,media,obb}/<pkg>）：
-            // 必须保持原样。它出现在本模块目标上只可能有两种情况——系统视图先于本模块
-            // 挂载存在，或本模块的 alias bind 已在上一轮摘除后露出了系统视图。两者都不
-            // 属于"本模块残留"，把目标视为已清空（其余低层若确有本模块残留，也已被系统
-            // 视图覆盖，摘除要等系统视图消失）。此前这里返回 false，会让 cleanup 永不
-            // 完整、detach 账本持续累积、reload 被 poisoned 拒绝，形成重挂循环。
-            if crate::module_mount_source::root_is_app_private_directory(&live.root) {
-                log::debug!(
-                    "daemon unmount keep system app-private view target={} mount_id={} root={}",
-                    target,
-                    live.mount_id,
-                    live.root
-                );
-                return true;
-            }
+            && known_devs.contains(&live.dev);
+        if !recorded(&live) && !is_owned_by_dev && !live.source.starts_with("srx_fuse") {
             log::warn!(
                 "daemon unmount skipped foreign mount target={} mount_id={} source={} root={} fs={} dev={} ledger_devs={}",
                 target,
@@ -2123,27 +2104,6 @@ fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>)
                 ledger.map_or(0, |ledger| ledger.mounts.len())
             );
             return false;
-        }
-        if let Some(ledger) = ledger {
-            // 只拦「比账本记录更新的一层」：那说明本模块的新会话已经接管这个挂载点，
-            // 摘掉它会把正在服务的挂载打掉。比记录更旧的层是本模块上一轮留下的残留，
-            // 必须一并摘净——否则每轮只能摘掉最上面一层，重挂又会补上一层，栈高永不下降。
-            let recorded_mount_id = ledger
-                .mounts
-                .iter()
-                .filter(|mount| mount.mount_point == normalized_target)
-                .map(|mount| mount.mount_id)
-                .max();
-            if recorded_mount_id.is_some_and(|recorded| live.mount_id > recorded) {
-                log::warn!(
-                    "daemon unmount skipped superseded mount target={} mount_id={} recorded={} ledger_generation={}",
-                    target,
-                    live.mount_id,
-                    recorded_mount_id.unwrap_or_default(),
-                    ledger.generation
-                );
-                return false;
-            }
         }
         if passes >= MAX_UNMOUNT_PASSES_HARD_LIMIT {
             log::warn!(
@@ -2185,7 +2145,9 @@ fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>)
 
         let errno = last_errno();
         if errno == libc::EINVAL || errno == libc::ENOENT {
-            return true;
+            // 路径错误不证明已清空；并发替换或观测失败仍必须阻止后续注入。
+            return mount_identity::try_topmost_live_mount(0, target)
+                .is_ok_and(|live| live.is_none());
         }
 
         log::warn!(

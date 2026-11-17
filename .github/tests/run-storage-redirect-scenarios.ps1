@@ -1454,7 +1454,7 @@ function Restart-MediaProviderWithHookReady {
 }
 
 function Test-AppUid {
-    $uidLine = (& adb -s $Serial shell "cmd package list packages -U '$AppId' 2>/dev/null | sed -n 's/.* uid://p' | head -1" |
+    $uidLine = (& adb -s $Serial shell "cmd package list packages --user 0 -U '$AppId' 2>/dev/null | sed -n 's/.* uid://p' | head -1" |
         ForEach-Object { $_ -replace "`r", "" } | Select-Object -First 1)
     if ($null -eq $uidLine) { "" } else { $uidLine.Trim() }
 }
@@ -3502,7 +3502,7 @@ function Invoke-ProviderSandboxScenario {
     for ($round = 1; $round -le 4 -and -not $positiveOk; $round++) {
         Start-Sleep -Seconds 5
         $mountOk = (Invoke-Su "grep -Eq 'perf companion mount pkg=$ProviderPackage pid=[0-9]+ .*ok=true' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-        $hookOk = (Invoke-Su "grep -Eq 'hook refresh start profile=system-writer pkg=$ProviderPackage ' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+        $hookOk = (Invoke-Su "grep -Eq 'hook install done profile=system-writer pkg=$ProviderPackage([[:space:]]|$)' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
         if ($mountOk -or $hookOk) { $positiveOk = $true; break }
         Invoke-Su "am force-stop '$ProviderPackage'; content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
     }
@@ -3517,7 +3517,7 @@ function Invoke-ProviderSandboxScenario {
         Write-Host "  - scenario-$Scenario/provider-sandbox: neither companion mount nor system-writer hook found after retries"
         return $false
     }
-    Invoke-Su "grep -hE 'perf companion mount pkg=$ProviderPackage|hook refresh start profile=system-writer pkg=$ProviderPackage ' '$LogPath' 2>/dev/null | tail -3" | Write-Host
+    Invoke-Su "grep -hE 'perf companion mount pkg=$ProviderPackage|hook install done profile=system-writer pkg=$ProviderPackage([[:space:]]|$)' '$LogPath' 2>/dev/null | tail -3" | Write-Host
     $true
 }
 

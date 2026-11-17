@@ -421,7 +421,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertIn("Ok(state) => (vec![state], ScopedMountAttempt::Ready", source)
             # 已服务判定必须只认**当前**宿主会话：旧代际的层已经失效，仍需重新挂。
             # 判据是超级块身份（dev）——挂载源已原生化，源文本不再能区分代际。
-            self.assertIn("Some(view.dev.as_str())", source)
+            self.assertIn("host_storage_aliases_current(", preattach)
             monitor_only = source.index("else if request.is_monitor_only")
             redirect = source.index("apply_sdcard_redirect(", source.index("preattach_shared_host("))
             self.assertLess(monitor_only, redirect, label)
@@ -1422,13 +1422,8 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("$DL_OWNER_PROBE_NAME", script)
 
     def test_provider_sandbox_accepts_both_governance_topologies(self) -> None:
-        # 场景 38 断言「下载提供器自身的原生写入被模块接管」。提供器被纳入
-        # system-writer 后（场景 39 需要它在自己进程内解析映射请求路径），pre 阶段
-        # 直接走 `writer skip companion mount`，不再发挂载请求，于是只认
-        # `perf companion mount ... ok=true` 的判据会把修好 39 的改动判成 38 回归
-        # （2026-10-26 本地实证：单跑场景 38 稳定 EXIT=1，日志里只有
-        # `hook refresh start profile=system-writer pkg=com.android.providers.downloads`）。
-        # 因此判据必须是拓扑无关的：mount 拓扑或 per-caller hook 拓扑命中其一即通过。
+        # system-writer 在进程内接管而不请求 companion 挂载；场景 38 接受任一拓扑，
+        # 但 hook 路径必须以安装完成为准，开始安装的日志不足以证明接管成功。
         script = read(".github/tests/run-storage-redirect-scenarios.sh")
         body = section(
             script, "run_provider_sandbox_scenario() {", "\nrun_download_owner_attribution_scenario()"
@@ -1437,14 +1432,14 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "perf companion mount pkg=${PROVIDER_PACKAGE} pid=[0-9]+ .*ok=true", body
         )
         self.assertIn(
-            "hook refresh start profile=system-writer pkg=${PROVIDER_PACKAGE} ", body
+            "hook install done profile=system-writer pkg=${PROVIDER_PACKAGE}([[:space:]]|$)", body
         )
         # 两条判据必须落在同一个 if 里（`||` 串联），否则等于只有一条生效。
         lines = body.splitlines()
         hook_index = [
             index
             for index, line in enumerate(lines)
-            if "hook refresh start profile=system-writer" in line and "adb_su" in line
+            if "hook install done profile=system-writer" in line and "adb_su" in line
         ]
         self.assertTrue(hook_index, "缺少 system-writer hook 判据")
         # `||` 写在上一条 stderr 检查行的行尾，因此看前一行的结尾。
@@ -1464,11 +1459,27 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "\nfunction Invoke-DownloadOwnerAttributionScenario",
         )
         self.assertIn("perf companion mount pkg=$ProviderPackage", ps_body)
-        self.assertIn("hook refresh start profile=system-writer pkg=$ProviderPackage", ps_body)
+        self.assertIn("hook install done profile=system-writer pkg=$ProviderPackage([[:space:]]|$)", ps_body)
         self.assertIn("if ($mountOk -or $hookOk)", ps_body)
         self.assertIn("sandbox=0", ps_body)
         self.assertIn("policy_registration_failed", ps_body)
         self.assertIn("fuse redirect mount start pkg=$ProviderPackage", ps_body)
+
+    @unittest.skipUnless(os.name == "posix", "需要 grep 执行设备日志判据")
+    def test_provider_hook_marker_requires_completed_install(self) -> None:
+        package = "com.android.providers.downloads"
+        for script, variable in ((self.bash, "${PROVIDER_PACKAGE}"), (self.powershell, "$ProviderPackage")):
+            pattern = re.search(r"grep -Eq '(hook install done [^']+)'", script).group(1)
+            pattern = pattern.replace(variable, package)
+            for message, matches in (
+                (f"hook install done profile=system-writer pkg={package}", True),
+                (f"hook install done profile=system-writer pkg={package} extra=1", True),
+                (f"hook install done profile=system-writer pkg={package}.other", False),
+                (f"hook refresh start profile=system-writer pkg={package}", False),
+            ):
+                with self.subTest(script=variable, message=message):
+                    result = subprocess.run(["grep", "-Eq", pattern], input=message + "\n", text=True)
+                    self.assertEqual(result.returncode, 0 if matches else 1)
 
     def test_scenario_40_runs_all_attribution_checks_in_both_runners(self) -> None:
         bash_runner = section(self.bash, "run_scenario() {", "\n# 与 PowerShell 共用设备端锁")
@@ -1782,10 +1793,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         aliases = section(
             host, "fn attach_host_view_to_storage_aliases(", "fn open_detached_mount("
         )
-        # 别名 bind 必须带同命名空间说明（主目标挂载已属于应用命名空间，bind 合法）。
-        self.assertIn("同一命名空间内的 bind 不跨命名空间", aliases)
+        # 别名先隔离传播再替换，失败必须回滚，不能只记录主入口成功。
+        self.assertLess(aliases.index("make_mount_private(&c_alias)"), aliases.index("libc::MS_BIND"))
+        self.assertIn("rollback_host_view(", aliases)
+        self.assertIn("storage_view_layers_replaceable(", aliases)
         host_ns_at = attach.index("setns(host_ns.get(), libc::CLONE_NEWNS)")
-        clone_at = attach.index("open_detached_mount(&c_mount_point)")
+        clone_at = attach.index("open_detached_mount(&c_mount_point, false)")
         app_ns_at = attach.index("setns(app_ns.get(), libc::CLONE_NEWNS)")
         move_at = attach.index("move_detached_mount(tree_fd.get(), &c_target)")
         self.assertLess(host_ns_at, clone_at, "克隆游离挂载必须在宿主命名空间内完成")
@@ -3229,11 +3242,11 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 且必须用文件系统类型把系统自己的媒体 FUSE 排除掉，否则会把「系统挂载存在」误当成
         # 「我们的重定向已生效」。
         self.assertIn("pub fn is_namespace_redirect_mount(", source)
-        self.assertIn("is_namespace_redirect_mount(&entry, package_name)", source)
+        self.assertRegex(source, r"\bis_namespace_redirect_mount\(&?entry, package_name\)")
         namespace_redirect = section(
             source,
             "pub fn is_namespace_redirect_mount(",
-            "\n/// 列出目标命名空间内全部由本模块创建",
+            "\npub fn app_redirect_mounts_in(",
         )
         self.assertIn("entry.fs_type.starts_with(\"fuse\")", namespace_redirect)
         self.assertIn("unescape_field(entry.root)", namespace_redirect)
@@ -3357,7 +3370,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 只能按**挂载点**识别（锚点目录是模块私有路径，系统不会往那里挂）。
         self.assertIn("pub fn is_module_anchor_mount_target(", source)
         predicate = section(
-            source, "pub fn is_module_redirect_mount(", "\n/// 列出目标命名空间内全部由本模块创建"
+            source, "pub fn is_module_redirect_mount(", "\npub fn app_redirect_mounts_in("
         )
         self.assertIn("is_module_anchor_mount_target(target)", predicate)
         self.assertIn("target: &str", predicate)
@@ -3374,41 +3387,23 @@ class ScenarioConsistencyTest(unittest.TestCase):
         app_mounts = section(
             source, "pub fn app_redirect_mounts_in(", "\n}\n")
         self.assertIn("is_module_redirect_mount(", app_mounts)
-        # 三个调用点都要把挂载点传进去，漏一个就会在那条路径上失配。
-        # mount_ledger 的登记已改为 capture_explicit_mount_identity（不经归属谓词，
-        # 直接取显式目标的 topmost 事实），不再调用 is_module_redirect_mount；
-        # 谓词调用点只剩 daemon_mount 的摘除归属。
-        for path, anchor, target_arg in (
-            ("src/daemon_mount.rs", "fn clear_mount_target_stack_verified(", "target,"),
-        ):
-            body = section(read(path), anchor, "\n}\n")
-            call = body[body.index("is_module_redirect_mount("):]
-            call_args = call[: call.index(")") + 1]
-            self.assertIn(
-                target_arg,
-                call_args,
-                f"{path} 里的 is_module_redirect_mount 调用必须把挂载点作为参数传入",
-            )
-
-        # 摘除与账本登记都必须走同一份判据，不得退回只看挂载源。
-        daemon_mount = read_daemon_mount_module()
-        clear = section(
-            daemon_mount,
-            "fn clear_mount_target_stack_verified(",
-            "\nfn is_mount_stack_cleared(",
-        )
-        self.assertIn("is_module_redirect_mount(", clear)
-        self.assertNotIn("is_module_mount_source(", clear)
+        # 清理不能仅凭相同 source/root 认领系统或第三方层：必须使用精确账本或会话 dev。
+        clear = section(read_daemon_mount_module(), "fn clear_mount_target_stack_verified(", "\nfn is_mount_stack_cleared(")
+        self.assertIn("mount.mount_id == layer.mount_id", clear)
+        self.assertIn("mount.dev == layer.dev", clear)
+        self.assertIn("known_devs.contains(&live.dev)", clear)
+        self.assertNotIn("is_module_redirect_mount(", clear)
+        self.assertNotIn("live.mount_id >", clear)
 
         ledger = read("src/mount_ledger.rs")
         capture = section(
-            ledger, "pub fn capture_explicit_mount_identity(", "\n/// 按本次挂载的目标集合登记账本"
+            ledger, "pub fn capture_explicit_mount_identity(", "\npub fn record_mount_identity("
         )
         # 登记必须走显式目标的 topmost 事实，不得经归属谓词：private-dir alias bind
         # 的 root 形态与系统挂载完全同形，谓词会把它漏出账本，cleanup 判 foreign
         # 永不完整、重挂循环不停（真机实测 wetype 等应用每次 reload 都触发）。
         self.assertNotIn("is_module_redirect_mount(", capture)
-        # `root` 是判据的唯一可靠依据，`LiveMount` 必须把它读出来。
+        # 系统视图识别需要同时校验树内根，不能只比较挂载源。
         self.assertIn("pub root: String", ledger)
 
         # 判据里的 `/sdcard` 标记与 `default_redirect_target` 是同一条约定的两处表达，

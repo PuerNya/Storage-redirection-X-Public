@@ -57,7 +57,7 @@ if ! wait_for_media_provider; then
   echo 'FAIL [zn_media_provider_ready] provider query unavailable' >&2
   exit 1
 fi
-uid="$(cmd package list packages -U "$app" | sed -n 's/.* uid://p')"
+uid="$(cmd package list packages --user 0 -U "$app" | sed -n 's/.* uid://p')"
 case "$uid" in ''|*[!0-9]*) echo 'ZN fixture: test application UID unavailable' >&2; exit 1 ;; esac
 test ! -e "$module/.runtime_disabled"
 scratch="$(mktemp -d /data/local/tmp/srx-zn-runtime.XXXXXX)"
@@ -148,7 +148,10 @@ cat "$scratch/reload.log"
 if [ "$ready" -eq 1 ] && [ "$reload_result" -eq 0 ] && [ "$(cat "$target_dir/Reloaded/reload.txt" 2>/dev/null)" = srx-zn-fixture ] && [ ! -e "$target_dir/reload.txt" ]; then
   echo 'PASS [zn_reload] running native process received updated mapping'; passed=$((passed + 1))
 else
-  echo "FAIL [zn_reload] ready=$ready exit=$reload_result" >&2; failed=$((failed + 1))
+  echo "FAIL [zn_reload] ready=$ready exit=$reload_result" >&2
+  cat "$config" >&2 || true
+  find "$source_dir" "$target_dir" "$sandbox_dir" -type f -exec ls -ln {} \; >&2 2>/dev/null || true
+  failed=$((failed + 1))
 fi
 rm -f "$config"
 printf '%s\n' '{"file_monitor_enabled":true,"verbose_logging_enabled":true}' > "$module/config/global.json"

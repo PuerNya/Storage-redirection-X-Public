@@ -284,7 +284,7 @@ pub fn is_module_redirect_mount(
     is_module_sandbox_root(root, package_name) || root_is_emulated_storage_view(root)
 }
 
-/// 列出目标命名空间内全部由本模块创建、或由本模块为本应用建立的挂载，按挂载 ID 升序。
+/// 列出目标命名空间内可达的模块挂载，按挂载 ID 升序。
 ///
 /// 应用进程用它判定"我的重定向是否已经生效"，替代了过去的挂载状态标记文件：挂载是内核
 /// 记录的事实，不需要任何组件额外写文件，也不会因为进程退出而留下残骸。`pid <= 0` 表示读取
@@ -303,7 +303,8 @@ pub fn is_module_redirect_mount(
 /// [`ModuleMount::is_sandbox_root`]，不要只数条数：FUSE 根的数量取决于 `allowed_real_paths`，
 /// 沙箱根在命名空间 bind 后端的所有重定向模式下都必然出现；collapsed hybrid FUSE 形态
 /// 例外——它的本体是视图根本身，须叠加 [`storage_view_root_is_module_session`] 判定。
-pub fn app_redirect_mounts_in(pid: i32, package_name: &str) -> Vec<ModuleMount> {
+/// 读取失败或超过上限时返回 None，清理调用方不能把它当成空挂载表。
+pub fn app_redirect_mounts_in(pid: i32, package_name: &str) -> Option<Vec<ModuleMount>> {
     let path = if pid > 0 {
         format!("/proc/{pid}/mountinfo")
     } else {
@@ -313,35 +314,41 @@ pub fn app_redirect_mounts_in(pid: i32, package_name: &str) -> Vec<ModuleMount> 
     // 而同一进程里存活的 PLT hook（本模块的路径改写 hook、第三方 zygisk 模块）都能
     // 改写 open/read 的返回值。一旦读到被净化或改写的视图，判据会失效——少认一条层
     // 就让应用空等满预算、被 AMS 判启动超时。详见 `platform::proc_direct`。
-    let Some(content) = proc_direct::read_proc_file(&path, MOUNTINFO_READ_LIMIT) else {
-        return Vec::new();
-    };
-    let mut mounts = content
+    let content = proc_direct::read_proc_file(&path, MOUNTINFO_READ_LIMIT)?;
+    let entries = content
         .lines()
-        .filter_map(|line| {
-            let entry = mountinfo::parse_entry(line)?;
+        .filter_map(mountinfo::parse_entry)
+        .collect::<Vec<_>>();
+    let mut mounts = entries
+        .iter()
+        .filter_map(|entry| {
+            let target = mountinfo::unescape_field(entry.target);
             let source = mountinfo::unescape_field(entry.source);
             let root = mountinfo::unescape_field(entry.root);
             if !is_module_mount_source(&source)
                 && !is_module_anchor_mount_source(&source)
-                && !is_namespace_redirect_mount(&entry, package_name)
+                && !is_namespace_redirect_mount(entry, package_name)
                 && !is_module_redirect_mount(
                     &source,
                     &root,
-                    &paths::normalize(&mountinfo::unescape_field(entry.target)),
+                    &paths::normalize(&target),
                     package_name,
                 )
             {
                 return None;
             }
+            // 隐藏层不能用于确认就绪，也不能按其路径卸载覆盖它的其它挂载。
+            if mountinfo::visible_mount_at(&entries, &target)?.mount_id != entry.mount_id {
+                return None;
+            }
             Some(ModuleMount {
                 mount_id: entry.mount_id,
                 source,
-                mount_point: paths::normalize(&mountinfo::unescape_field(entry.target)),
+                mount_point: paths::normalize(&target),
                 is_sandbox_root: is_module_sandbox_root(&root, package_name),
             })
         })
         .collect::<Vec<_>>();
     mounts.sort_by_key(|mount| mount.mount_id);
-    mounts
+    Some(mounts)
 }

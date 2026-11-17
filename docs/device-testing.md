@@ -21,6 +21,32 @@ me.fakerqu.test.storageredirection.TEST_CASE
 
 本地 Rust 编译、Rust 测试和 Gradle APK 构建/测试在 WSL 中执行；设备侧场景在 Windows PowerShell 中通过 Windows ADB 直接运行。两个阶段共享仓库里的构建产物，不需要把 Windows ADB 转发给 WSL。普通排障也可以只针对设备当前已安装的模块运行 Windows 设备脚本。
 
+系统存储视图延迟覆盖的隔离回归入口为 `.github/tests/run-storage-view-recovery.py`，只接受模拟器。
+`build_native_tests.sh` 随 native 产物编译 `storage-view-fixture`；该夹具仅能修改测试应用自己的存储根和
+用户别名。运行前授予测试应用存储权限，由各用户的测试服务创建沙箱 Download 并验证健康写入，
+再依次构造系统视图覆盖、移除后替换、重复覆盖、挂载丢失和未知
+挂载接管。故障后保持应用 PID、namespace、策略及宿主身份不变，不发送强制重挂或 Provider 重启命令。
+每轮保存原始 mountinfo、账本、应用结果及真实/沙盒落点；恢复要求栈顶和账本一致、栈高为一、应用读写
+落到沙盒且不穿透真实路径。故障必须由原始挂载身份确认；Provider 在覆盖期间仍能保护部分 I/O，
+这类成功写入单独记录，不作为视图已恢复的证据。
+
+```powershell
+python .github/tests/run-storage-view-recovery.py --serial emulator-5554 --fixture build/test-flow/native/storage-view-fixture --output temp/storage-view-recovery # 记录隔离恢复结果
+```
+
+该测试构造可控的挂载顺序，不等同于复现某个厂商 ROM 的冷启动时序。外部挂载变化由普通周期 reconcile
+兜底，每轮观察预算默认 360 秒；未知挂载在整个观察期内必须保持原样。
+`--user <id>` 可对已启动且已安装测试 APP 的次用户运行同一组故障，权限与文件落点均按该用户区分。
+加上 `--isolation-user <other-id>` 会先为另一已启动用户准备权限和相同规则，并启动对照应用；每次观测
+都要求对照从健康 SRX 视图开始，进程、mountinfo 与账本保持不变，故障恢复后还需确认该用户写入自己的沙盒。
+
+`--namespace-bind` 使用无附加规则的自动回退，验证父入口覆盖、子 bind 丢失、重复覆盖与未知父树保护。
+该模式不接受 `--isolation-user`；每个存储别名都通过打开路径后的 `fdinfo.mnt_id` 独立核对可达层，
+避免把仍留在 mountinfo 中的隐藏子挂载误报为恢复成功。未知父树在整个观察期内必须保持原样。
+每轮从新应用进程的 bind 回退开始，故障到恢复期间不重启；恢复可选 bind 或共享宿主，均须核对实际可达层、
+账本及文件落点，不要求恢复后仍选择原后端。新建文件分别保留原始元数据记录；元数据一致性比较同一个
+既有文件恢复前后的读取、覆盖写入，避免把不同后端新建文件的权限差异误判为恢复修改了既有文件。
+
 在 WSL 中构建模块、编译 Android 测试二进制、运行 Gradle 单元测试并打包模块 zip：
 
 ```bash
@@ -287,7 +313,7 @@ Android 17（API 37.0）有三处执行环境差异：
 | 35 | 任意路径映射矩阵：验证公共存储、`Android/data|media|obb/<包名>`、`/data/user`、`/data/data` 及公共路径之间的相对/绝对映射；公共到应用私有目录从空沙盒开始，目标文件必须存在，公共源和沙盒不得残留文件。 |
 | 36 | 映射应用私有别名后，仍可写入 MediaProvider 已创建的现有文件。 |
 | 37 | 父路径先映射到中间目录后，中间目录下的子路径继续命中下一条映射并落到最终目录；应用通过请求路径枚举目录时必须看到最终目标中的文件。 |
-| 38 | 下载提供器自身 `sandboxed_paths` 接管标记：companion mount 成功（`perf companion mount pkg=... ok=true`）或进程内 system-writer hook（`hook refresh start profile=system-writer pkg=...`）其一即可；`sandbox=0` 请求、`attach skipped ... policy_registration_failed` 或提供器自建模块 FUSE 会话判为回归。该场景脚本只检查接管拓扑，不提交提供器原生写入；实际沙盒落点需由单独设备用例验证，CI 模拟器不含所需 XL 引擎。 |
+| 38 | 下载提供器自身 `sandboxed_paths` 接管标记：companion mount 成功（`perf companion mount pkg=... ok=true`）或进程内 system-writer hook（`hook install done profile=system-writer pkg=...`）其一即可；`sandbox=0` 请求、`attach skipped ... policy_registration_failed` 或提供器自建模块 FUSE 会话判为回归。该场景脚本只检查接管拓扑，不提交提供器原生写入；实际沙盒落点需由单独设备用例验证，CI 模拟器不含所需 XL 引擎。 |
 | 39 | 下载提供器（共享 uid 代写者）经 DownloadManager 异步下载公共路径时，按发起者（测试 APP）的 `path_mappings` 把目标改写到映射目标落盘，真实请求路径零穿透；文件出现在真实请求路径或下载失败即按源归因回归（2026-10-24 真机：误归因组内成员、行数据反查未触发）。 |
 | 40 | 系统 uid 的 FUSE 写入按发起服务归因；应用经 MediaProvider 中转创建的文件归因到源头应用；系统 uid 的沙盒目标缺失时零穿透，不得落到真实路径。 |
 | 41 | 沙盒根（重定向根 `Android/data/<包名>/sdcard`）在应用重启时由模块重建：属主必须是应用、**组不得是应用自己的 uid**，只能取父目录的组（setgid 继承）或 `media_rw`(1023)/`ext_data_rw`(1078)；other 位不得可写，mode 只允许 `02770`/`02771`。随后应用自己写一个文件、再由 MediaProvider 代写一条 `Documents/SrtSandboxRootProbe`，两者都必须落在沙盒内，真实公共路径不得出现该目录或文件（2026-11-09 真机：沙盒根 gid 被写成应用 uid，系统代写 EACCES 后回退到真实公共路径，公共存储凭空长出 `Documents/ringtone/...`）。 |

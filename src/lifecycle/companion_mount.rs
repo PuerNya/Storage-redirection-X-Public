@@ -250,11 +250,7 @@ fn mount_one_storage_view_barrier(
             if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
                 let known = crate::mount_ledger::known_module_fuse_devs();
                 let current = crate::fuse_host::current_host_dev();
-                // 系统视图根自己的超级块必须受保护：本模块曾对系统视图做过 bind，
-                // 而 bind 继承的是**系统 MediaProvider** 的超级块，于是这个 dev 会随账本
-                // 进入 known 集合。若只按 "dev 在 known 里且不是当前宿主" 判死层，系统自己的
-                // `…/emulated` 层就会被当成本模块死层摘掉——真机表现正是"重定向应用的
-                // 别名根层消失、只剩 …/emulated/<user>"（2026-11-02 实测，见 P5 设计文档 D1）。
+                // 系统存储根的超级块额外受保护，不能作为旧宿主死层摘除。
                 let user_id = crate::platform::user_id_from_uid(request.uid);
                 let protected = crate::mount::propagation::system_view_root_devs(user_id);
                 let mut stale_layers = Vec::new();
@@ -1670,8 +1666,11 @@ fn preattach_shared_host(
     }
     // 视图根已被**当前**宿主会话服务（daemon reconcile 抢先挂好或上一轮保留）：本轮不再
     // 叠层，但仍按宿主挂载记账，否则状态文件里没有这条目标、下一轮清理会漏摘。
-    if crate::fuse_session::storage_view_top_dev(&attach_root).as_deref() == Some(view.dev.as_str())
-    {
+    if crate::fuse_host::host_storage_aliases_current(
+        &attach_root,
+        crate::platform::user_id_from_uid(request.uid),
+        &view.dev,
+    ) {
         log::info!(
             "shared host preattach skipped, current host layer already serving pid={} pkg={} target={}",
             request.pid,

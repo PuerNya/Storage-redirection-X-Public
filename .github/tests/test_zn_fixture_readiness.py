@@ -10,6 +10,27 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("timeout"), "需要 bash 与 timeout")
 class ZnFixtureReadinessTest(unittest.TestCase):
+    def test_user_zero_fixture_ignores_other_installed_users(self):
+        source = (ROOT / ".github/tests/run-zn-runtime-fixture.sh").read_text(encoding="utf-8")
+        query = next(line for line in source.splitlines() if line.startswith('uid="$(cmd package'))
+        script = '''set -eu
+app=me.fakerqu.test.storageredirect
+cmd() {
+  if [ "$*" = "package list packages --user 0 -U $app" ]; then
+    printf 'package:%s uid:10192\\n' "$app"
+  else
+    printf 'package:%s uid:10192,1010192\\n' "$app"
+  fi
+}
+'''
+        result = subprocess.run(["bash", "-c", script + query + '\nprintf "%s" "$uid"'], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "10192")
+        for name in ("run-storage-redirect-scenarios.ps1", "run-storage-redirect-scenarios.sh"):
+            source = (ROOT / ".github/tests" / name).read_text(encoding="utf-8")
+            self.assertIn("cmd package list packages --user 0 -U", source)
+            self.assertNotIn("cmd package list packages -U", source)
+
     def test_provider_must_answer_before_the_fixture_starts(self):
         source = (ROOT / ".github/tests/run-zn-runtime-fixture.sh").read_text(encoding="utf-8")
         start = source.index("wait_for_media_provider() {")

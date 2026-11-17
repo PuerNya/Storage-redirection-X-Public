@@ -35,8 +35,8 @@ static FUSE_APP_READ_PATCHED: AtomicBool = AtomicBool::new(false);
 ///
 /// 这里是**每个 read 调用**都会走到的热路径：不同 ROM 只映射其中一到两个库（例如
 /// 模拟器只有 `libappfuse`、MIUI 才有独立 `libfuse`），只要有一个库永远不出现，固定
-/// 500ms 的重试就会让该进程**永久**每两秒做一次 ELF 定位（dlopen / APK 内嵌段扫描），
-/// 单次成本远高于一次 read。改为按库指数退避：500ms 起、连续失败倍增、上限 30 秒；
+/// 500ms 的重试会让该进程持续执行 ELF 定位（dlopen / APK 内嵌段扫描）。
+/// 按库指数退避从 500ms 起连续失败倍增，上限 5 分钟；
 /// 库定位成功且补丁装上后该库不再被尝试。
 ///
 /// 「定位成功但 PLT 无槽位」（A13/A14 实证的静默分支）同样计入失败，否则它会以
@@ -74,7 +74,7 @@ pub(crate) fn retry_after_late_load() {
     if now_ms.saturating_sub(last_ms) < LATE_LOAD_RETRY_MERGE_MS {
         if !LATE_LOAD_RETRY_PENDING.swap(true, Ordering::AcqRel) {
             let delay_ms = LATE_LOAD_RETRY_MERGE_MS - now_ms.saturating_sub(last_ms);
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("srx-fuse-patch-retry".to_string())
                 .spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
@@ -84,21 +84,26 @@ pub(crate) fn retry_after_late_load() {
                     if !LATE_LOAD_RETRY_PENDING.swap(false, Ordering::AcqRel) {
                         return;
                     }
-                    let now_ms = crate::platform::paths::monotonic_ms();
-                    LATE_LOAD_RETRY_LAST_MS.store(now_ms, Ordering::Relaxed);
-                    reset_patch_backoff();
-                    ensure_fuse_engine_read_patch();
-                    fuse_fix::retry_if_target_enabled();
+                    apply_late_load_patches();
                 });
+            if spawned.is_err() {
+                LATE_LOAD_RETRY_PENDING.store(false, Ordering::Release);
+                apply_late_load_patches();
+            }
         }
         return;
     }
-    LATE_LOAD_RETRY_LAST_MS.store(now_ms, Ordering::Relaxed);
     LATE_LOAD_RETRY_PENDING.store(false, Ordering::Release);
+    apply_late_load_patches();
+}
+
+fn apply_late_load_patches() {
+    let _guard = context::ReentryGuard::enter();
+    LATE_LOAD_RETRY_LAST_MS.store(crate::platform::paths::monotonic_ms(), Ordering::Relaxed);
     reset_patch_backoff();
     ensure_fuse_engine_read_patch();
     // 零宽修复的目标库（libfuse_jni）同样是按需 dlopen 的，一起补。
-    fuse_fix::retry_if_target_enabled();
+    fuse_fix::retry_after_late_load();
 }
 
 /// 目标库刚被 `dlopen`：清掉退避状态，让紧接着的检查立刻重试。
