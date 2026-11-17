@@ -346,7 +346,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             adb.write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
-                "  reboot) kill -TERM \"$EMULATOR_PID\" 2>/dev/null || true ;;\n"
+                "  reboot) printf 'reboot\\n' >> \"$MOCK_REBOOT_EVENTS\"; kill -TERM \"$EMULATOR_PID\" 2>/dev/null || true ;;\n"
                 "  'shell cat /proc/sys/kernel/random/boot_id') cat \"$MOCK_BOOT_ID\" ;;\n"
                 "  'shell getprop sys.boot_completed') printf '1\\n' ;;\n"
                 "  'kill-server') : ;;\n"
@@ -356,8 +356,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
             )
             adb.chmod(0o755)
             harness = (
-                f"export PATH={root}:$PATH MOCK_BOOT_ID={boot_id}\n"
+                f"export PATH={root}:$PATH MOCK_BOOT_ID={boot_id} MOCK_REBOOT_EVENTS={root / 'reboot-events'}\n"
                 "export CURRENT_BOOT=old\n"
+                "adb_root() { [ \"$*\" = sync ] && printf 'sync\\n' >> \"$MOCK_REBOOT_EVENTS\"; }\n"
                 "sleep() { command sleep 0.01; }\n"
                 "wait_for_emulator_shutdown() { wait \"$EMULATOR_PID\" 2>/dev/null || true; }\n"
                 "start_emulator_and_boot() {\n"
@@ -379,6 +380,36 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("重新启动已打补丁的 AVD", result.stderr)
             self.assertIn("boot_id=new", result.stdout)
+            self.assertEqual(["sync", "reboot"], (root / "reboot-events").read_text().splitlines())
+
+    @unittest.skipUnless(shutil.which("bash"), "需要 Bash 验证重启前落盘失败")
+    def test_ksu_reboot_stops_when_sync_fails(self) -> None:
+        source = read(".github/tests/install-storage-redirect-module.sh")
+        reboot = section(source, "wait_for_reboot() {", "# 先固定可用的 su 形式")
+        harness = (
+            "EMULATOR_PID=''\n"
+            "adb_root() { echo sync_failed >&2; return 1; }\n"
+            + reboot + "\nwait_for_reboot 1\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            adb = Path(directory) / "adb"
+            events = Path(directory) / "reboot-events"
+            adb.write_text(
+                "#!/bin/sh\ncase \"$*\" in\n"
+                "  'shell cat /proc/sys/kernel/random/boot_id') printf 'old\\n' ;;\n"
+                "  *) printf '%s\\n' \"$*\" >> \"$MOCK_REBOOT_EVENTS\"; exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            adb.chmod(0o755)
+            result = subprocess.run(
+                [shutil.which("bash"), "-eu", "-c", f"export PATH={directory}:$PATH MOCK_REBOOT_EVENTS={events}\n" + harness],
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertFalse(events.exists(), "落盘失败后不得发起重启或继续轮询")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("sync_failed", result.stderr)
+        self.assertIn("重启前落盘失败", result.stderr)
 
     def test_module_verify_skips_wait_when_post_fs_data_missed(self) -> None:
         script = read(".github/tests/install-storage-redirect-module.sh")

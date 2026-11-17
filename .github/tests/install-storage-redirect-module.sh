@@ -166,6 +166,11 @@ wait_for_reboot() {
     return 1
   fi
 
+  # 非空校验不能证明写入已落盘；重启前提交模块和配置数据。
+  if ! adb_root 'sync'; then
+    echo "重启前落盘失败，拒绝继续重启。" >&2
+    return 1
+  fi
   adb reboot >/dev/null 2>&1 || true
   deadline=$((SECONDS + timeout_seconds))
   while [ "$SECONDS" -lt "$deadline" ]; do
