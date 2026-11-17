@@ -4209,7 +4209,7 @@ check_health() {
 #
 # 与 `srxctl diagnostic-archive` 的分工：那份是面向用户的完整支持包（打包日志、配置、
 # 每个进程的完整 status/fd/task 快照，体积与时延都大，由用户按需触发）；这里要的是
-# **失败瞬间、几十秒内、只读**的定向取证，能挂在场景失败路径上自动执行。两者取的交集
+# **失败瞬间、几十秒内、不修改存储状态**的定向取证，能挂在场景失败路径上自动执行。两者取的交集
 # 只是 mountinfo，其余各自服务不同读者。
 capture_storage_bad_state_snapshot() {
   local label="$1"
@@ -4217,6 +4217,9 @@ capture_storage_bad_state_snapshot() {
   : >"$out" || return 1
   {
     echo "=== device storage bad state snapshot label=${label} ==="
+    echo "--- MediaProvider 原生线程栈 ---"
+    adb_su "for pkg in com.google.android.providers.media.module com.android.providers.media.module com.android.providers.media; do for pid in \$(pidof \"\$pkg\" 2>/dev/null); do echo \"pkg=\$pkg pid=\$pid\"; timeout 6 debuggerd -b \"\$pid\" 2>&1 || true; done; done" 2>&1 | tr -d '\r' || true
+    echo
     echo "--- shell 与 root 的基线访问 ---"
     echo "shell_probe=$(adb shell "ls ${REAL_ROOT}/Download >/dev/null 2>&1 && echo ok || echo denied" 2>/dev/null | tr -d '\r' || true)"
     echo "root_probe=$(adb_su "ls ${REAL_ROOT}/Download >/dev/null 2>&1 && echo ok || echo denied" 2>/dev/null | tr -d '\r' || true)"

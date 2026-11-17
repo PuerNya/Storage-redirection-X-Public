@@ -98,6 +98,10 @@ run_case() {
     echo "FAIL [zn_$name] expected_exit=$expected actual_exit=$result evidence=$evidence" >&2
     "$module/bin/srx_daemon" package-query P 0 "$package" >&2 || true
     grep -F "$package:" "$module/config/system_writer_uids.list" >&2 || true
+    echo "=== ZN 失败现场 name=$name ===" >&2
+    timeout 5 ls -ldZ /storage/emulated /storage/emulated/0 /storage/emulated/0/Download "$source_dir" >&2 || true
+    tail -160 "$module/logs/running.log" >&2 || true
+    dmesg | grep 'avc:.*denied' | tail -20 >&2 || true
     failed=$((failed + 1))
   fi
 }

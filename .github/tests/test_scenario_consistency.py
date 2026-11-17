@@ -2261,6 +2261,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "test-flow-shared-fuse-before.txt",
             "test-flow-shared-fuse-after.txt",
             "media-health.txt",
+            "storage-bad-state-*.txt",
         }
         for workflow in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
             source = read(workflow)
@@ -2273,6 +2274,8 @@ class ScenarioConsistencyTest(unittest.TestCase):
             build = section(source, "      - name: Build x86_64 module zip and test app", "      - name: Upload")
             test_flow = section(source, "  test-flow:", "  test-flow-required:")
             artifact = test_flow[test_flow.index("          path: |") :]
+            upload = section(test_flow, "      - name: Upload test-flow artifacts", "      - name: Upload shared FUSE snapshots")
+            self.assertIn("'temp/test-flow/**/storage-bad-state-*.txt'", upload)
 
             self.assertIn("components: clippy", rust_toolchain)
             self.assertIn(
