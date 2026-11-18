@@ -110,15 +110,15 @@ dump_case_evidence() {
   label="$1"
   echo "--- evidence: $label ---" >&2
   echo "[global.json]" >&2
-  cat "$module/config/global.json" 2>/dev/null >&2 || true
+  cat "$module/config/global.json" >&2 2>/dev/null || true
   echo "[app.json]" >&2
   if [ -n "${config:-}" ] && [ -f "$config" ]; then cat "$config" >&2 || true; else echo '<absent>' >&2; fi
   echo "[source_dir]" >&2
-  ls -la "${source_dir:-}" 2>/dev/null >&2 || true
+  ls -la "${source_dir:-}" >&2 2>/dev/null || true
   echo "[target_dir]" >&2
-  ls -la "${target_dir:-}" 2>/dev/null >&2 || true
+  ls -la "${target_dir:-}" >&2 2>/dev/null || true
   echo "[file_monitor.log tail]" >&2
-  tail -n 15 "$module/logs/file_monitor.log" 2>/dev/null >&2 || true
+  tail -n 15 "$module/logs/file_monitor.log" >&2 2>/dev/null || true
   echo "[module warn log tail]" >&2
   logcat -d -v brief -s StorageRedirect:* 2>/dev/null | tail -n 25 >&2 || true
   echo "[storage mount labels]" >&2
