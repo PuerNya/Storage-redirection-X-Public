@@ -763,6 +763,13 @@ jobs:
             temp/test-flow/**/media-health.txt
             temp/test-flow/**/storage-bad-state-*.txt
 
+      - name: Upload enqueue timeout diagnostics
+        if: always() && hashFiles('temp/test-flow/**/storage-bad-state-enqueue*.txt') != ''
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: enqueue-diagnostics-android${{ matrix.android.version }}
+          path: temp/test-flow/**/storage-bad-state-enqueue*.txt
+          retention-days: 7
       - name: Upload shared FUSE snapshots
         if: always() && hashFiles('temp/test-flow/**/test-flow-shared-fuse-before.txt', 'temp/test-flow/**/test-flow-shared-fuse-after.txt') != ''
         uses: actions/upload-artifact@v7.0.1

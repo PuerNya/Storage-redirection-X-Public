@@ -2128,6 +2128,15 @@ run_service_case() {
 
     adb_su "rm -f '$freshness_marker'" >/dev/null
     echo "result_timeout scenario=${scenario} test_case=${test_case} attempt=${drive_attempt}"
+    if [ "$test_case" = "downloadmanager_enqueue" ]; then
+      local blocked_pid
+      adb logcat -b all -d >"${SRT_ARTIFACT_DIR}/storage-bad-state-enqueue-logcat-${drive_attempt}.txt" 2>&1 || true
+      for blocked_pid in $(adb_su "pidof '$APP_ID' com.android.providers.downloads com.google.android.providers.media.module com.android.providers.media.module" 2>/dev/null | tr -d '\r'); do
+        [[ "$blocked_pid" =~ ^[0-9]+$ ]] || continue
+        # 重试会销毁阻塞线程，先采集活进程栈和内核等待点。
+        adb_su "cat /proc/$blocked_pid/status /proc/$blocked_pid/wchan; timeout 4 debuggerd -b $blocked_pid" >"${SRT_ARTIFACT_DIR}/storage-bad-state-enqueue-${drive_attempt}-${blocked_pid}.txt" 2>&1 || true
+      done
+    fi
     adb shell am force-stop "$APP_ID" >/dev/null || true
   done
   echo "FAIL [${test_case}] scenario=${scenario} label=${label} reason=result_timeout" >&2
