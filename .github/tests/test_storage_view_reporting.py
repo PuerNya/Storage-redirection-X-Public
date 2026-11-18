@@ -33,7 +33,7 @@ class StorageViewReportingTest(unittest.TestCase):
         device = RUNNER.Device("emulator-test", Path("unused"))
         calls = []
 
-        def adb(*args):
+        def adb(*args, **kwargs):
             calls.append(args)
             return "0\n" if args == ("shell", "id -u") else "done\n"
 
@@ -45,7 +45,7 @@ class StorageViewReportingTest(unittest.TestCase):
         device = RUNNER.Device("emulator-test", Path("unused"))
         calls = []
 
-        def adb(*args):
+        def adb(*args, **kwargs):
             calls.append(args)
             if args == ("shell", "id -u"):
                 return "2000\n"
@@ -60,6 +60,16 @@ class StorageViewReportingTest(unittest.TestCase):
             ("shell", "su 0 id -u"),
             ("shell", "su 0 sh -c 'touch /tmp/test'"),
         ])
+
+    def test_permission_preparation_budget_does_not_expand_observation_calls(self) -> None:
+        device = RUNNER.Device("emulator-test", Path("unused"))
+        device._root_shell = True
+        result = RUNNER.subprocess.CompletedProcess([], 0, "ready\n", "")
+        with patch.object(RUNNER.subprocess, "run", return_value=result) as run:
+            self.assertEqual(device.su("permissions", timeout=180), "ready\n")
+            self.assertEqual(run.call_args.kwargs["timeout"], 180)
+            device.su("cat /proc/1/mountinfo")
+            self.assertEqual(run.call_args.kwargs["timeout"], 45)
 
     def test_invalid_app_result_preserves_raw_record(self) -> None:
         raw = "FAIL [file_write] EACCES"

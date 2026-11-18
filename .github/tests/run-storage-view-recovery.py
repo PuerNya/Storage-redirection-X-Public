@@ -211,20 +211,20 @@ class Device:
         self.owned_files = []
         self._root_shell = None
 
-    def adb(self, *args: str) -> str:
-        run = subprocess.run(["adb", "-s", self.serial, *args], capture_output=True, text=True, encoding="utf8", errors="replace", timeout=45)
+    def adb(self, *args: str, timeout: int = 45) -> str:
+        run = subprocess.run(["adb", "-s", self.serial, *args], capture_output=True, text=True, encoding="utf8", errors="replace", timeout=timeout)
         if run.returncode:
             raise RuntimeError(run.stdout + run.stderr)
         return run.stdout.replace("\r", "")
 
-    def su(self, command: str) -> str:
+    def su(self, command: str, timeout: int = 45) -> str:
         if self._root_shell is None:
             self._root_shell = self.adb("shell", "id -u").strip() == "0"
             if not self._root_shell and self.adb("shell", "su 0 id -u").strip() != "0":
                 raise RuntimeError("root ADB or KernelSU su 0 is required")
         if self._root_shell:
-            return self.adb("shell", command)
-        return self.adb("shell", "su 0 sh -c " + shlex.quote(command))
+            return self.adb("shell", command, timeout=timeout)
+        return self.adb("shell", "su 0 sh -c " + shlex.quote(command), timeout=timeout)
 
     def read(self, path: str) -> str:
         return self.su(f"if test -f {shlex.quote(path)}; then cat {shlex.quote(path)}; else printf __absent__; fi")
@@ -486,7 +486,7 @@ def main() -> None:
         device.su(f"chmod 755 {device.remote}/fixture")
         users = [args.user] + ([] if args.isolation_user is None else [args.isolation_user])
         for user in users:
-            permissions = device.su(f"sh {device.remote}/permissions.sh {APP} {user}")
+            permissions = device.su(f"sh {device.remote}/permissions.sh {APP} {user}", timeout=180)
             args.output.joinpath(f"permissions-{user}.txt").write_text(permissions, encoding="utf8")
         device.write(GLOBAL, json.dumps(dict(file_monitor_enabled=False, fuse_fix_enabled=True, storage_backend_mode="auto", verbose_logging_enabled=True, auto_enable_redirect_for_new_apps=False)))
         if args.namespace_bind:

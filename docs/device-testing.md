@@ -23,7 +23,7 @@ me.fakerqu.test.storageredirection.TEST_CASE
 
 系统存储视图延迟覆盖的隔离回归入口为 `.github/tests/run-storage-view-recovery.py`，只接受模拟器；需要 root ADB 或可用的 KernelSU `su 0`。
 `build_native_tests.sh` 随 native 产物编译 `storage-view-fixture`；该夹具仅能修改测试应用自己的存储根和
-用户别名。运行前授予测试应用存储权限；各用户先通过内部目录 stat 启动测试服务，保存同一进程的
+用户别名。运行前授予测试应用存储权限，每个用户的授权与 AppOps 校验最多等待 180 秒；各用户先通过内部目录 stat 启动测试服务，保存同一进程的
 挂载观测，最多等待 360 秒确认视图与账本就绪，再由服务创建可见 Download 并验证健康写入。
 这一步不预先启动 Provider，也不通过应用重启或强制重挂补救；冷启动 Provider 尚未服务存储时的
 首次外部 I/O 可失败，故障注入的健康基线与这段接入窗口分开判断。
