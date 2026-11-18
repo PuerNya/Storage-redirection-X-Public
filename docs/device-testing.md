@@ -81,6 +81,8 @@ CI/Release 仍由 Linux runner 在 Android 模拟器上运行完整 shell 测试
 
 MediaProvider 的 hook 就绪记录按 PID 分开保存，并同时核对 boot id 和进程启动时钟；另一用户的进程不会覆盖已有记录，同一 boot 内复用的 PID 也不能沿用旧凭据。无后缀记录保留最新诊断；缺少进程启动时钟的旧记录不会被当作当前进程已就绪。
 
+场景主动重启 MediaProvider 后，先给 emulated 存储最多 45 秒恢复，再检查 Provider 查询和 hook；存储仍未恢复时场景失败，不触发额外重挂。
+
 存储故障现场 `storage-bad-state-*.txt` 在其他存储探针之前采集 MediaProvider 原生线程栈，单个进程最多等待 6 秒；采集失败仍继续保留其他诊断。CI 与 Release 的 Android 15/16 测试工件包含这份现场。
 
 公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁。CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再把 Android 15/16/17 模拟器组成并行矩阵运行，每个 Android 版本各自执行完整 scenario 1-44。Android 17（API 37.0）已经并入同一测试矩阵，不再是独立 job；`Test-flow required gate` 统一校验三个平台，任一失败都会拦住 CI 资产发布与正式 Release。CI/Release 只有在全部测试流场景通过后才会继续发布 CI 资产、更新 `update.json` 或创建正式 Release。测试流失败时保留 GitHub Actions 失败记录、日志和已上传的排障 artifact，由后续提交修复。

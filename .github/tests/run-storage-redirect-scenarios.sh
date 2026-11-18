@@ -1986,7 +1986,7 @@ restart_media_provider_with_hook_ready() {
   for attempt in 1 2; do
     adb logcat -c >/dev/null 2>&1 || true
     restart_media_provider
-    wait_storage_ready "${label}-storage-attempt-${attempt}" 30 >/dev/null || return 1
+    wait_storage_ready "${label}-storage-attempt-${attempt}" 45 >/dev/null || return 1
     wait_media_provider_ready "${label}-provider-attempt-${attempt}" 60 >/dev/null || return 1
     if wait_media_provider_hook_ready "${label}-attempt-${attempt}" 20; then
       return 0

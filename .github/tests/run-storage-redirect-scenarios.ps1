@@ -1444,7 +1444,7 @@ function Restart-MediaProviderWithHookReady {
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         Invoke-Adb @("logcat", "-c") | Out-Null
         Restart-MediaProvider
-        if (-not (Wait-Storage "$Label-storage-attempt-$attempt" 30)) { return $false }
+        if (-not (Wait-Storage "$Label-storage-attempt-$attempt" 45)) { return $false }
         if (-not (Wait-MediaProviderReady "$Label-provider-attempt-$attempt" 60)) { return $false }
         if (Wait-MediaProviderHookReady "$Label-attempt-$attempt" 20) {
             return $true

@@ -2532,6 +2532,8 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("start_ticks=$currentStartTicks", ps_wait)
         self.assertIn("for attempt in 1 2", bash_wait)
         self.assertIn("$attempt -le 2", ps_wait)
+        self.assertIn('wait_storage_ready "${label}-storage-attempt-${attempt}" 45', bash_wait)
+        self.assertIn('Wait-Storage "$Label-storage-attempt-$attempt" 45', ps_wait)
         self.assertIn("restart_media_provider_with_hook_ready", bash_scenario)
         self.assertIn("Restart-MediaProviderWithHookReady", ps_scenario)
         self.assertLess(
