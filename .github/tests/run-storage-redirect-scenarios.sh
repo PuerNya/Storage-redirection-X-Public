@@ -248,7 +248,7 @@ detect_adb_root_mode() {
 }
 
 test_app_uid() {
-  adb shell "cmd package list packages -U '$APP_ID' 2>/dev/null | sed -n 's/.* uid://p' | head -1" | tr -d '\r'
+  adb shell "cmd package list packages --user 0 -U '$APP_ID' 2>/dev/null | sed -n 's/.* uid://p' | head -1" | tr -d '\r'
 }
 
 fix_private_backend_permissions() {
@@ -1937,12 +1937,13 @@ wait_media_provider_hook_ready() {
   local deadline=$((SECONDS + timeout_seconds))
 
   while [ "$SECONDS" -lt "$deadline" ]; do
-    local pid boot_id install_state hook_lines
+    local pid boot_id current_start_ticks install_state hook_lines
     pid="$(media_provider_pid)"
     if [ -n "$pid" ]; then
       boot_id="$(adb shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r')"
-      install_state="$(adb_su "cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || true" | tr -d '\r')"
-      if [ -n "$boot_id" ] && grep -Fq "stage=init_ok pid=${pid} boot_id=${boot_id} " <<<"$install_state"; then
+      current_start_ticks="$(adb_su "sed 's/^.*) //' /proc/${pid}/stat 2>/dev/null | awk '{print \$20}'" | tr -d '\r')"
+      install_state="$(adb_su "cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state.${pid} 2>/dev/null || cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || true" | tr -d '\r')"
+      if [ -n "$boot_id" ] && [ -n "$current_start_ticks" ] && grep -Fq "stage=init_ok pid=${pid} boot_id=${boot_id} start_ticks=${current_start_ticks} " <<<"$install_state"; then
         echo "media_provider_hook_ready label=${label} pid=${pid} source=install-state"
         return 0
       fi
@@ -2487,7 +2488,7 @@ run_provider_sandbox_scenario() {
   # scoped 会话后原生写入穿透真实存储。
   # 判定标记（拓扑无关，两种服务方式都算通过）：
   #   通过 A（mount 拓扑）：`perf companion mount pkg=... ok=true`（挂载流程成功）
-  #   通过 B（per-caller hook 拓扑）：`hook refresh start profile=system-writer pkg=下载提供器`
+  #   通过 B（per-caller hook 拓扑）：`hook install done profile=system-writer pkg=下载提供器`
   #     —— 下载提供器纳入 system-writer 后，冷启动即装 full writer hook 集
   #     （stat/realpath/mkdir 等），pre 阶段直接走 `writer skip companion mount`，
   #     不再发挂载请求，原生写入的沙盒重定向由进程内 per-caller hook 兜底。
@@ -2506,7 +2507,7 @@ run_provider_sandbox_scenario() {
   while [ "$attempt" -le 4 ]; do
     sleep 5
     if adb_su "grep -Eq 'perf companion mount pkg=${PROVIDER_PACKAGE} pid=[0-9]+ .*ok=true' '$LOG_PATH'" ||
-      adb_su "grep -Eq 'hook refresh start profile=system-writer pkg=${PROVIDER_PACKAGE} ' '$LOG_PATH'"; then
+      adb_su "grep -Eq 'hook install done profile=system-writer pkg=${PROVIDER_PACKAGE}([[:space:]]|$)' '$LOG_PATH'"; then
       assertions_ok=1
       break
     fi
@@ -2525,7 +2526,7 @@ run_provider_sandbox_scenario() {
     return 1
   fi
   echo "step 5/7 内: 提供器沙盒策略标记确认"
-  adb_su "grep -hE 'perf companion mount pkg=${PROVIDER_PACKAGE}|hook refresh start profile=system-writer pkg=${PROVIDER_PACKAGE} ' '$LOG_PATH' 2>/dev/null | tail -3" || true
+  adb_su "grep -hE 'perf companion mount pkg=${PROVIDER_PACKAGE}|hook install done profile=system-writer pkg=${PROVIDER_PACKAGE}([[:space:]]|$)' '$LOG_PATH' 2>/dev/null | tail -3" || true
   return 0
 }
 
@@ -2706,7 +2707,7 @@ run_download_owner_attribution_scenario() {
     # running.log 会按大小轮转成 running.log.1（本地实测 514 行 : 17709 行），
     # 单个场景内一旦轮转，早先的 hook 安装记录就落到 .1 里。上一轮 CI 的
     # `---hook_registered---` 全空正是这么来的——不是 hook 没装，是搜错了文件。
-    adb_su "{ echo global_config=; cat '$GLOBAL_CONFIG' 2>/dev/null; echo; echo debug_lines=\$(cat '$LOG_DIR'/running.log* 2>/dev/null | grep -ac 'RsDebug' || echo 0); echo warn_lines=\$(cat '$LOG_DIR'/running.log* 2>/dev/null | grep -ac 'RsWarn' || echo 0); echo ---hook_registered---; grep -aE 'hook registered profile|optional hooks unavailable|hook refresh start' '$LOG_DIR'/running.log* 2>/dev/null | tail -8; echo ---media_hook_state---; ls -la '$LOG_DIR'/.media_hook_install_state 2>/dev/null || echo state_absent; cat '$LOG_DIR'/.media_hook_install_state 2>/dev/null; }" >&2 || true
+    adb_su "{ echo global_config=; cat '$GLOBAL_CONFIG' 2>/dev/null; echo; echo debug_lines=\$(cat '$LOG_DIR'/running.log* 2>/dev/null | grep -ac 'RsDebug' || echo 0); echo warn_lines=\$(cat '$LOG_DIR'/running.log* 2>/dev/null | grep -ac 'RsWarn' || echo 0); echo ---hook_registered---; grep -aE 'hook registered profile|optional hooks unavailable|hook install done' '$LOG_DIR'/running.log* 2>/dev/null | tail -8; echo ---media_hook_state---; ls -la '$LOG_DIR'/.media_hook_install_state 2>/dev/null || echo state_absent; cat '$LOG_DIR'/.media_hook_install_state 2>/dev/null; }" >&2 || true
     # 进程注入状态：run 40291854472 的 CI 里本场景只留下 1 条 req map，没有任何
     # mkdir/redirect 决策记录，而本地同一操作有 writer: caller map、query fallback、
     # realpath mapped 一串。两种原因在日志上完全同形——进程压根没加载模块，或日志被
@@ -4209,7 +4210,7 @@ check_health() {
 #
 # 与 `srxctl diagnostic-archive` 的分工：那份是面向用户的完整支持包（打包日志、配置、
 # 每个进程的完整 status/fd/task 快照，体积与时延都大，由用户按需触发）；这里要的是
-# **失败瞬间、几十秒内、只读**的定向取证，能挂在场景失败路径上自动执行。两者取的交集
+# **失败瞬间、几十秒内、不修改存储状态**的定向取证，能挂在场景失败路径上自动执行。两者取的交集
 # 只是 mountinfo，其余各自服务不同读者。
 capture_storage_bad_state_snapshot() {
   local label="$1"
@@ -4217,6 +4218,9 @@ capture_storage_bad_state_snapshot() {
   : >"$out" || return 1
   {
     echo "=== device storage bad state snapshot label=${label} ==="
+    echo "--- MediaProvider 原生线程栈 ---"
+    adb_su "for pkg in com.google.android.providers.media.module com.android.providers.media.module com.android.providers.media; do for pid in \$(pidof \"\$pkg\" 2>/dev/null); do echo \"pkg=\$pkg pid=\$pid\"; timeout 6 debuggerd -b \"\$pid\" 2>&1 || true; done; done" 2>&1 | tr -d '\r' || true
+    echo
     echo "--- shell 与 root 的基线访问 ---"
     echo "shell_probe=$(adb shell "ls ${REAL_ROOT}/Download >/dev/null 2>&1 && echo ok || echo denied" 2>/dev/null | tr -d '\r' || true)"
     echo "root_probe=$(adb_su "ls ${REAL_ROOT}/Download >/dev/null 2>&1 && echo ok || echo denied" 2>/dev/null | tr -d '\r' || true)"

@@ -166,6 +166,11 @@ wait_for_reboot() {
     return 1
   fi
 
+  # 非空校验不能证明写入已落盘；重启前提交模块和配置数据。
+  if ! adb_root 'sync'; then
+    echo "重启前落盘失败，拒绝继续重启。" >&2
+    return 1
+  fi
   adb reboot >/dev/null 2>&1 || true
   deadline=$((SECONDS + timeout_seconds))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -492,15 +497,16 @@ restart_media_provider_process() {
 wait_media_provider_hook_ready() {
   local label="$1"
   local timeout_seconds="${2:-60}"
-  local deadline pid boot_id install_state
+  local deadline pid boot_id current_start_ticks install_state
   deadline=$((SECONDS + timeout_seconds))
   while [ "$SECONDS" -lt "$deadline" ]; do
     adb shell content query --uri content://media/external_primary/file --projection _id --where '_id=-1' >/dev/null 2>&1 || true
     pid="$(media_provider_pid)"
     if [ -n "$pid" ]; then
       boot_id="$(adb shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r' || true)"
-      install_state="$(adb_su 'cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || true' | tr -d '\r')"
-      if [ -n "$boot_id" ] && grep -Fq "stage=init_ok pid=${pid} boot_id=${boot_id} " <<<"$install_state"; then
+      current_start_ticks="$(adb_su "sed 's/^.*) //' /proc/${pid}/stat 2>/dev/null | awk '{print \$20}'" | tr -d '\r')"
+      install_state="$(adb_su "cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state.${pid} 2>/dev/null || cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || true" | tr -d '\r')"
+      if [ -n "$boot_id" ] && [ -n "$current_start_ticks" ] && grep -Fq "stage=init_ok pid=${pid} boot_id=${boot_id} start_ticks=${current_start_ticks} " <<<"$install_state"; then
         echo "media_provider_hook_ready label=${label} pid=${pid} boot_id=${boot_id}"
         return 0
       fi

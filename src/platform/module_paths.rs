@@ -58,8 +58,8 @@ pub const MEDIA_HOOK_DEFERRED_FILE: &str =
 ///
 /// 系统代写进程只输出 logcat、不写模块日志文件，而 MediaProvider 的
 /// specialize 发生在测试流清空 logcat 之前，因此安装结果在事后排查时
-/// 两边都取不到。这里把结果写入文件，使「hook 从未安装」与
-/// 「已安装但未触发」在失败后仍可区分。
+/// 两边都取不到。追加 `.<pid>` 的文件供就绪判断读取；记录还包含 boot id 和进程启动时钟，
+/// 无后缀文件保留最新诊断。
 pub const MEDIA_HOOK_INSTALL_STATE_FILE: &str =
     "/data/adb/modules/storage.redirect.x/logs/.media_hook_install_state";
 /// MediaProvider 进程内热重载请求与确认文件。

@@ -223,9 +223,10 @@ request_running_app_remount() {
 media_provider_hook_ready() {
   pid="$1"
   boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
-  [ -n "$pid" ] && [ -n "$boot_id" ] || return 1
-  install_state=$(cat "$LOGS_DIR/.media_hook_install_state" 2>/dev/null)
-  printf '%s\n' "$install_state" | grep -Fq "stage=init_ok pid=$pid boot_id=$boot_id "
+  process_start_ticks=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+  [ -n "$pid" ] && [ -n "$boot_id" ] && [ -n "$process_start_ticks" ] || return 1
+  install_state=$(cat "$LOGS_DIR/.media_hook_install_state.$pid" 2>/dev/null || cat "$LOGS_DIR/.media_hook_install_state" 2>/dev/null)
+  printf '%s\n' "$install_state" | grep -Fq "stage=init_ok pid=$pid boot_id=$boot_id start_ticks=$process_start_ticks "
 }
 
 wait_for_media_provider_hook_ready() {

@@ -91,6 +91,43 @@ def run_service_cases(combinations, bases, function, extension):
 
 
 class ScenarioResultReportingTest(unittest.TestCase):
+    @unittest.skipUnless(BASH, "需要 Bash 验证故障现场采集")
+    def test_storage_snapshot_retains_native_stack_failures_and_continues(self):
+        source = (ROOT / ".github/tests/run-storage-redirect-scenarios.sh").read_text(encoding="utf-8")
+        function = source[source.index("capture_storage_bad_state_snapshot() {"):source.index("print_diagnostics() {")]
+        for stack_exit in (0, 124):
+            with self.subTest(stack_exit=stack_exit), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                script = r'''
+set -euo pipefail
+SRT_ARTIFACT_DIR=$1
+REAL_ROOT=/storage/emulated/0
+BACKEND_ROOT=/data/media/0
+PRIVATE_ROOT=/private
+RESULT_DIR=/results
+INTERNAL_RESULT_DIR=/internal
+BACKEND_RESULT_DIR=/backend
+SANDBOX_RESULT_DIR=/sandbox
+APP_ID=test.app
+adb() { echo adb_probe; }
+adb_su() {
+  if [[ $1 == *'debuggerd -b'* ]]; then
+    echo "native_stack exit=$SRX_STACK_EXIT"
+    return "$SRX_STACK_EXIT"
+  fi
+  echo root_probe
+}
+''' + function + '\ncapture_storage_bad_state_snapshot probe\n'
+                path = base / "snapshot.sh"
+                path.write_text(script, encoding="utf-8", newline="\n")
+                result = subprocess.run([BASH, str(path), str(base)], text=True, capture_output=True, timeout=15,
+                                        env={**os.environ, "SRX_STACK_EXIT": str(stack_exit)})
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                snapshot = (base / "storage-bad-state-probe.txt").read_text()
+                self.assertIn(f"native_stack exit={stack_exit}", snapshot)
+                self.assertIn("--- 模块进程 ---\nroot_probe", snapshot)
+                self.assertIn("device_storage_bad_state_snapshot label=probe", result.stdout)
+
     @unittest.skipUnless(PWSH, "需要 PowerShell 验证重定向输出编码")
     def test_entrypoints_override_non_utf8_console_encoding(self):
         for relative, end in (
