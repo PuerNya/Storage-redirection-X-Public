@@ -78,7 +78,7 @@ cmd() {
 test "$1" = query && test "$2" = --uri && test "$3" = content://media/external_primary/file || exit 2
 count=$(cat "$SRX_READY_COUNT")
 count=$((count + 1))
-printf '%s' "$count" > "$SRX_READY_COUNT"
+printf '%s' "$count" > "$SRX_READY_COUNT.tmp" && mv "$SRX_READY_COUNT.tmp" "$SRX_READY_COUNT"
 if test "$count" -ge "$SRX_READY_ATTEMPTS"; then
   printf '%s\n' 'No result found'
 else
