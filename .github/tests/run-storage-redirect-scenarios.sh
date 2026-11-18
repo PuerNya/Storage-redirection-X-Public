@@ -1667,9 +1667,21 @@ wait_storage_ready() {
   local timeout_seconds="${2:-90}"
   local deadline=$((SECONDS + timeout_seconds))
 
+  local captured_pid=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     if adb shell "sm list-volumes all 2>/dev/null | grep -q 'emulated;0 mounted' && test -d '$REAL_ROOT' && ls -ld '$REAL_ROOT' >/dev/null 2>&1" >/dev/null 2>&1; then
       return 0
+    fi
+    if [ "$label" = "scenario-29-provider-reset-storage-attempt-1" ] && [ "$SECONDS" -ge "$((deadline - timeout_seconds + 2))" ]; then
+      local pid
+      pid="$(media_provider_pid)"
+      if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "$captured_pid" ]; then
+        captured_pid="$pid"
+        # 启动超时会杀死进程，须在存储仍不可用时采集实际启动线程。
+        local artifact="${SRT_ARTIFACT_DIR}/storage-bad-state-media-start-${pid}.txt"
+        adb_su "cat /proc/$pid/status /proc/$pid/wchan /proc/$pid/syscall; timeout 3 debuggerd -b $pid" >"$artifact" 2>&1 || true
+        adb_su "cat /proc/$pid/maps" >>"$artifact" 2>&1 || true
+      fi
     fi
     sleep 2
   done
