@@ -83,14 +83,19 @@ class StorageViewRecoveryTest(unittest.TestCase):
                 "MountVerdict::Detached",
             )
             untranslated_parent_root = source.replace(
-                "live.root == init_root",
-                "live.root == init.root",
+                'format!("{}/{suffix}", backing_root.trim_end_matches(\'/\'))',
+                "backing_root",
+            )
+            wrong_user_parent_root = source.replace(
+                'format!("/user/{user_id}")',
+                "init.root",
             )
             unrelated_host_root = source.replace('live.root == format!("/{suffix}")', "true")
             for name, mutant in (
                 ("blocked_recovery", blocked_recovery),
                 ("foreign_probe", foreign_probe),
                 ("untranslated_parent_root", untranslated_parent_root),
+                ("wrong_user_parent_root", wrong_user_parent_root),
                 ("unrelated_host_root", unrelated_host_root),
             ):
                 with self.subTest(mutant=name):

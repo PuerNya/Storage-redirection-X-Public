@@ -271,6 +271,17 @@ fn main() {
     assert_eq!(supervise_mount_request(&request).unwrap().last_action, RecoveryAction::ReinjectOnly, "init-namespace backing beneath a removed target is detached, not a takeover");
     assert_eq!(fuse_supervisor::PROBES.load(std::sync::atomic::Ordering::Relaxed), 1);
 
+    let secondary = MountRequest { pid: 40, uid: 1010100, package_name: "test".into() };
+    for (root, dev, expected) in [
+        ("/user/10/emulated", "0:23", RecoveryAction::ReinjectOnly),
+        ("/user/0/emulated", "0:23", RecoveryAction::SkipSuperseded),
+        ("/user/100/emulated", "0:23", RecoveryAction::SkipSuperseded),
+        ("/user/10/emulated", "0:99", RecoveryAction::SkipSuperseded),
+    ] {
+        *LIVE.lock().unwrap() = Some(LiveMount { root: root.into(), dev: dev.into(), ..backing.clone() });
+        assert_eq!(supervise_mount_request(&secondary).unwrap().last_action, expected, "{root} on {dev}");
+    }
+
     *REQUEST_TARGET.lock().unwrap() = "/mnt/user/0/emulated".into();
     *VISIBLE_POINT.lock().unwrap() = "/mnt".into();
     *LIVE.lock().unwrap() = Some(LiveMount { root: "/user/0/emulated".into(), ..layer(305, "0:23", "/") });

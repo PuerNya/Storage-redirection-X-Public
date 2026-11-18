@@ -493,11 +493,24 @@ pub fn supervise_mount_request(
                     .unwrap_or("")
                     .trim_start_matches('/');
                 mount_identity::topmost_live_mount(1, point).is_some_and(|init| {
-                    // live.root 已换算到目标路径，init.root 也要补上同一后缀再比较。
-                    let init_root = if suffix.is_empty() {
-                        init.root.clone()
+                    // Android 为每个用户 bind 同一 tmpfs 的 /user/<id> 到 /storage。
+                    let backing_root = if point == "/storage"
+                        && init.fs_type == "tmpfs"
+                        && suffix.split('/').next() == Some("emulated")
+                        && init
+                            .root
+                            .strip_prefix("/user/")
+                            .is_some_and(|id| id.parse::<u32>().is_ok())
+                    {
+                        format!("/user/{user_id}")
                     } else {
-                        format!("{}/{suffix}", init.root.trim_end_matches('/'))
+                        init.root
+                    };
+                    // live.root 已换算到目标路径，父挂载也要补上同一后缀再比较。
+                    let init_root = if suffix.is_empty() {
+                        backing_root
+                    } else {
+                        format!("{}/{suffix}", backing_root.trim_end_matches('/'))
                     };
                     live.dev == init.dev
                         && live.fs_type == init.fs_type
