@@ -77,6 +77,27 @@ class StorageViewReportingTest(unittest.TestCase):
             RUNNER.validate_app_result(raw, "file_write")
         self.assertIn(raw, str(error.exception))
 
+    def test_alias_uses_app_credentials_and_checks_physical_destination(self) -> None:
+        device = RUNNER.Device("emulator-test", Path("unused"))
+        parent = "/mnt/user/10/emulated"
+        trailer = "\n__SRT_RESULT_END__=1\n__SRT_RESULT_TOKEN__=" + "a" * 32
+        denied = "FAIL [file_stat] stat failed: EACCES (Permission denied)"
+        with patch.object(device, "app_case", return_value=denied + trailer) as stat, patch.object(device, "app_write") as write:
+            self.assertFalse(device.check_alias_io(10, "alias", parent))
+            stat.assert_called_once_with(10, "alias-stat", "file_stat", file_path=parent + "/10/Download")
+            write.assert_not_called()
+            for raw in (denied, "FAIL [file_stat] stat failed: ENOENT" + trailer, "FAIL [file_write] EACCES" + trailer):
+                stat.return_value = raw
+                with self.assertRaises(AssertionError):
+                    device.check_alias_io(10, "alias", parent)
+            stat.return_value = "PASS [file_stat] stat succeeded" + trailer
+            write.return_value = dict(raw="PASS [file_write] success" + trailer, payload="data", private="data", real="__absent__", metadata="1000:1078:660")
+            self.assertTrue(device.check_alias_io(10, "alias", parent))
+            write.assert_called_once_with(10, "alias", "issue18-alias", parent=parent)
+            write.return_value["real"] = "data"
+            with self.assertRaises(AssertionError):
+                device.check_alias_io(10, "alias", parent)
+
     def test_normal_and_foreign_controls(self) -> None:
         self.check()
         foreign = {**self.fault, "mountinfo": self.fault["mountinfo"].replace("fuse /dev/fuse", "tmpfs issue18-foreign")}
@@ -128,6 +149,22 @@ class StorageViewReportingTest(unittest.TestCase):
                 self.check(fault={**self.fault, key: value})
         with self.assertRaises(AssertionError):
             RUNNER.validate(self.before, self.fault, self.after, [], False)
+
+    def test_single_alias_fault_requires_an_independent_healthy_control(self) -> None:
+        alias = "/mnt/user/0/emulated"
+        for target, control in ((TARGET, alias), (alias, TARGET)):
+            with self.subTest(target=target):
+                control_layer = mount(201, 1, "0:38").replace(TARGET, control)
+                snapshots = []
+                for sample, identifier in ((self.before, 200), (self.fault, 200), (self.after, 3)):
+                    snapshots.append({**sample, "mountinfo": sample["mountinfo"].replace(TARGET, target) + control_layer,
+                                      "ledger": f"mount={identifier}\t0:38\t/dev/fuse\t{target}\nmount=201\t0:38\t/dev/fuse\t{control}\n"})
+                RUNNER.validate(*snapshots, [target], False)
+                for index in (1, 2):
+                    damaged = list(snapshots)
+                    damaged[index] = {**damaged[index], "mountinfo": damaged[index]["mountinfo"].replace(control_layer, "")}
+                    with self.assertRaisesRegex(AssertionError, "control alias"):
+                        RUNNER.validate(*damaged, [target], False)
 
     def test_app_output_and_backend_disagreement_are_failures(self) -> None:
         raw = "PASS [file_write] success\n__SRT_RESULT_END__=1\n__SRT_RESULT_TOKEN__=" + "a" * 32 + "\n"
@@ -280,8 +317,8 @@ class StorageViewReportingTest(unittest.TestCase):
         device.app_write = app_write
         with patch.object(RUNNER.time, "sleep"):
             self.assertEqual(device.start(11), "42")
-        self.assertEqual(calls[0], ("shell", "am start-user -w 11"))
-        self.assertEqual(calls[2][2:], ("file_stat", {"file_path": f"/data/user/11/{RUNNER.APP}"}))
+        self.assertEqual(calls[0], ("shell", f"am force-stop --user 11 {RUNNER.APP}"))
+        self.assertEqual(calls[1][2:], ("file_stat", {"file_path": f"/data/user/11/{RUNNER.APP}"}))
         self.assertEqual(len(observations), 2)
         mkdir = next(call for call in calls if isinstance(call[0], int) and call[2] == "file_mkdir")
         self.assertEqual(mkdir[3], {"file_dir": "/storage/emulated/11/Download"})
@@ -294,6 +331,27 @@ class StorageViewReportingTest(unittest.TestCase):
         device.app_write = lambda *args: self.fail("write ran after failed launch")
         with self.assertRaisesRegex(AssertionError, "successful operation"):
             device.start(11)
+
+    def test_system_first_waits_for_the_selected_volume_before_app_launch(self) -> None:
+        device = RUNNER.Device("emulator-test", Path("unused"))
+        calls = []
+        device.adb = lambda *args: calls.append(args)
+        states = iter(("pending", "ready"))
+        device.su = lambda command: calls.append(command) or next(states)
+        with patch.object(RUNNER.time, "sleep"):
+            device.prepare_user(11)
+        self.assertEqual(calls, [("shell", "am start-user 11"), calls[1], calls[1]])
+        self.assertIn("am get-started-user-state 11", calls[1])
+        self.assertIn("^emulated;11 mounted ", calls[1])
+        self.assertIn("/proc/1/root/mnt/user/11/emulated/11", calls[1])
+
+    def test_system_volume_timeout_keeps_the_app_stopped(self) -> None:
+        device = RUNNER.Device("emulator-test", Path("unused"))
+        device.adb = lambda *args: ""
+        device.su = lambda command: "pending"
+        device.app_case = lambda *args, **kwargs: self.fail("app launched before the volume was ready")
+        with patch.object(RUNNER.time, "monotonic", side_effect=[0, 900]), self.assertRaisesRegex(AssertionError, "user 11 storage"):
+            device.prepare_user(11)
 
     def test_result_timeout_keeps_the_stale_raw_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

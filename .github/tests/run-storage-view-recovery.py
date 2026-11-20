@@ -57,10 +57,11 @@ def view_restored(snapshot: dict, target: str, dev: str) -> bool:
     )
 
 
-def validate_app_result(raw: str, case: str) -> None:
+def validate_app_result(raw: str, case: str, *, stat_denied: bool = False) -> None:
     lines = raw.splitlines()
     messages = [line for line in lines if not line.startswith("__SRT_RESULT_")]
-    if len(messages) != 1 or not messages[0].startswith(f"PASS [{case}] "):
+    prefix = "FAIL [file_stat] stat failed: EACCES (Permission denied)" if stat_denied else f"PASS [{case}] "
+    if len(messages) != 1 or not messages[0].startswith(prefix):
         raise AssertionError(f"app result was not one successful operation: {raw!r}")
     if len(lines) != 3 or lines.count("__SRT_RESULT_END__=1") != 1 or len([line for line in lines if re.fullmatch(r"__SRT_RESULT_TOKEN__=[0-9a-f]{32}", line)]) != 1:
         raise AssertionError("app result was incomplete or ambiguous")
@@ -186,6 +187,12 @@ def validate(before: dict, fault: dict, after: dict, targets: list[str], foreign
         raise AssertionError("trusted system storage anchor missing")
     if fault.get("ledger") != before.get("ledger"):
         raise AssertionError("ledger changed before the fault was captured")
+    for target in storage_parents(user):
+        if target in targets or not top(before["mountinfo"], target):
+            continue
+        if (not view_restored(before, target, dev) or mounts(before["mountinfo"], target) != mounts(fault["mountinfo"], target)
+                or not view_restored(after, target, dev)):
+            raise AssertionError(f"control alias did not retain a healthy view: {target}")
     for target in targets:
         original, changed, final = (top(s["mountinfo"], target) for s in (before, fault, after))
         if not original or original["dev"] != dev or (not changed and not missing) or changed and changed["dev"] == dev:
@@ -291,9 +298,9 @@ done'''
         self.output.joinpath(name + "-result.txt").write_text(text, encoding="utf8")
         return text
 
-    def app_write(self, user: int, name: str, payload: str, path_name: str | None = None) -> dict:
+    def app_write(self, user: int, name: str, payload: str, path_name: str | None = None, *, parent: str = "/storage/emulated") -> dict:
         file_name = path_name or name
-        path = f"/storage/emulated/{user}/Download/issue18-{file_name}.txt"
+        path = f"{parent}/{user}/Download/issue18-{file_name}.txt"
         private = f"/data/media/{user}/Android/data/{APP}/sdcard/Download/issue18-{file_name}.txt"
         real = f"/data/media/{user}/Download/issue18-{file_name}.txt"
         self.owned_files.extend((private, real))
@@ -303,10 +310,31 @@ done'''
         self.output.joinpath(name + "-io.json").write_text(json.dumps(record, indent=2), encoding="utf8")
         return record
 
+    def check_alias_io(self, user: int, name: str, parent: str) -> bool:
+        raw = self.app_case(user, name + "-stat", "file_stat", file_path=f"{parent}/{user}/Download")
+        denied = raw.startswith("FAIL [file_stat]")
+        validate_app_result(raw, "file_stat", stat_denied=denied)
+        if not denied:
+            validate_io(self.app_write(user, name, "issue18-alias", parent=parent))
+        return not denied
+
+    def prepare_user(self, user: int) -> None:
+        self.adb("shell", f"am start-user {user}")
+        deadline = time.monotonic() + 900
+        probe = (
+            f"am get-started-user-state {user} | grep -qx RUNNING_UNLOCKED && "
+            f"sm list-volumes all | grep -q '^emulated;{user} mounted ' && "
+            f"timeout 3 stat /proc/1/root/mnt/user/{user}/emulated/{user} >/dev/null 2>&1 "
+            "&& echo ready || echo pending"
+        )
+        while self.su(probe).strip() != "ready":
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"user {user} storage did not become ready before app launch")
+            time.sleep(2)
+
     def start(self, user: int, namespace_bind: bool = False, system_only: bool = False) -> str:
         if namespace_bind and system_only:
             raise ValueError("system-only startup cannot use the namespace-bind readiness check")
-        self.adb("shell", f"am start-user -w {user}")
         self.adb("shell", f"am force-stop --user {user} {APP}")
         # 后台用户的 Activity 未必启动进程；服务由 shell 显式指定用户发起。
         # 先用内部目录启动服务；存储故障注入必须从就绪视图开始，不能拿接入中的 I/O 当基线。
@@ -486,6 +514,7 @@ def main() -> None:
         device.su(f"chmod 755 {device.remote}/fixture")
         users = [args.user] + ([] if args.isolation_user is None else [args.isolation_user])
         for user in users:
+            device.prepare_user(user)
             permissions = device.su(f"sh {device.remote}/permissions.sh {APP} {user}", timeout=180)
             args.output.joinpath(f"permissions-{user}.txt").write_text(permissions, encoding="utf8")
         device.write(GLOBAL, json.dumps(dict(file_monitor_enabled=False, fuse_fix_enabled=True, storage_backend_mode="auto", verbose_logging_enabled=True, auto_enable_redirect_for_new_apps=False)))
@@ -498,8 +527,11 @@ def main() -> None:
                 run_system_first_attachment(device, args.user, enabled_config, delay_seconds, reports)
         isolation_pid = None
         pid = None
-        for index, mode in enumerate(() if args.namespace_bind else ("cover", "replace", "cover", "missing", "foreign")):
-            name = f"{index}-{mode}-{uuid.uuid4().hex[:8]}"
+        cases = (("cover", None), ("replace", None), ("cover", None), ("missing", None),
+                 ("cover", "/storage/emulated"), ("cover", f"/mnt/user/{args.user}/emulated"), ("foreign", None))
+        for index, (mode, single_target) in enumerate(() if args.namespace_bind else cases):
+            scope = "" if single_target is None else "-primary" if single_target == "/storage/emulated" else "-user-alias"
+            name = f"{index}-{mode}{scope}-{uuid.uuid4().hex[:8]}"
             try:
                 if args.isolation_user is not None and isolation_pid is None:
                     isolation_pid = device.start(args.isolation_user)
@@ -513,8 +545,15 @@ def main() -> None:
                     validate_io(device.app_write(args.isolation_user, name + "-isolation-control", "issue18-other-user"))
                 dev = fields(before["host"])["dev"]
                 targets = [target for target in storage_parents(args.user) if top(before["mountinfo"], target)]
+                if single_target is not None:
+                    if single_target not in targets or len(targets) < 2:
+                        raise AssertionError(f"missing independent storage alias for {single_target}")
+                    targets = [single_target]
                 control = device.app_write(args.user, name + "-control", "issue18-control")
                 validate_io(control)
+                alias = single_target if single_target and single_target != "/storage/emulated" else None
+                if alias:
+                    alias_accessible = device.check_alias_io(args.user, name + "-alias-control", alias)
                 for target in targets:
                     command = [device.remote + "/fixture", pid, before["uid"], str(args.user), target, mode, dev]
                     device.su(shlex.join(command))
@@ -550,6 +589,8 @@ def main() -> None:
                 if mode != "foreign":
                     io = device.app_write(args.user, name + "-recovered", "issue18-recovered")
                     validate_io(io, control["metadata"])
+                if alias and device.check_alias_io(args.user, name + "-alias-recovered", alias) != alias_accessible:
+                    raise AssertionError(f"app access through recovered alias changed: {alias}")
                 reports.append(dict(case=name, passed=True, targets=targets, mode=mode, observations=observations))
                 print("PASS " + name, flush=True)
             except Exception as error:
