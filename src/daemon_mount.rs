@@ -839,6 +839,9 @@ pub fn execute_mount_request(request: &MountRequest) -> bool {
     );
     if is_success {
         remember_successful_mount(request);
+        if request.operation == MountOperation::Reload {
+            maybe_probe_passthrough(request);
+        }
     }
     let total_ms = monotonic_ms().saturating_sub(started_ms);
     if total_ms >= DAEMON_MOUNT_SLOW_MS || !is_success {
@@ -1593,7 +1596,6 @@ fn try_bind_to_fuse_host(
     // move_mount 完成即传播已发生：事件通知宿主摘除 /data/media/0 副本（挂载表
     // 卫生；数据面已由 f2fs 直连锚点解耦）。fire-and-forget，不阻塞接入。
     crate::fuse_host_control::notify_host_unpropagate();
-    maybe_probe_passthrough(request, attached.host_pid, mount_root);
     Some(FuseMountState {
         target: attached.target,
         child: 0,
@@ -1602,33 +1604,10 @@ fn try_bind_to_fuse_host(
     })
 }
 
-/// 探针文件名（视图根与后端根同名对射）。
-const PASSTHROUGH_PROBE_REL: &str = ".srx_passthrough_probe";
-
-/// 共享宿主挂载后的端到端 passthrough 探针。
-///
-/// 背景：部分 OEM 内核（实测 ColorOS）的 FUSE passthrough backing 实现有缺陷，
-/// 应用 open 返回 EIO，而失败发生在内核处理 open 回包的阶段——宿主对它完全
-/// 不可见，没有任何日志痕迹。因此无法被动发现，只能在挂载后主动踩一次：
-///
-/// 1. daemon 在后端根写入探针文件（重定向应用=沙盒根，未配置应用=真实存储根）；
-/// 2. 探针线程 `setfsuid(应用 uid)` 后经 `/proc/<应用 pid>/root/...` 打开视图内
-///    的探针文件——该 open 穿过应用命名空间里的 FUSE 挂载，以应用自己的 uid 和
-///    策略走完整条内核路径（包括 passthrough 绑定），与应用真实行为完全同构；
-/// 3. open/read 得 EIO → 判定内核缺陷：持久化设备级状态并终止宿主，由 reconcile
-///    重建成 passthrough 关闭的新宿主（宿主换代是既有恢复通路，应用短暂重挂）；
-///    成功 → 记 ok，本 boot 后续宿主直接开启；其它 errno（EACCES/ENOENT，
-///    多为 SELinux 或文件可见性时序）→ 不判定，保持开启并留痕。
-///
-/// **探针必须以 root（不 setfsuid）执行**：视图 attr 按 FUSE 请求 uid 动态改写，
-/// 且内核按 inode 缓存 DAC 判定结果——setfsuid(应用 uid) 的 open 会被其它 uid
-/// 视角缓存的 attr 卡成 EACCES（真机实测），既测不出 ok 也测不出 EIO。root 凭
-/// CAP_DAC_OVERRIDE 绕过 DAC 与缓存语义；而 passthrough backing 绑定发生在内核
-/// FUSE open 路径，与调用者 uid 无关，root 探测对内核缺陷完全等效。
-///
-/// 状态绑定 boot_id：每次重启重新探测，内核 OTA 修复后设备自动恢复开启。
-/// 探测在独立线程执行，绝不阻塞 daemon 挂载主循环（FUSE open 理论上可能阻塞）。
-fn maybe_probe_passthrough(request: &MountRequest, host_pid: i32, mount_root: &str) {
+/// 以 root 在宿主原挂载上只读探测内核 open 回包，不在公共视图创建、覆盖或删除文件。
+/// 系统标记不可用时保持 unknown；只有确认宿主 inode 后的 open/read EIO 才触发降级。
+fn maybe_probe_passthrough(request: &MountRequest) {
+    static PROBING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // 逃生口存在时不探测（用户已显式关闭，无降级意义）。
     if crate::config::is_fuse_passthrough_disabled() {
         return;
@@ -1640,110 +1619,77 @@ fn maybe_probe_passthrough(request: &MountRequest, host_pid: i32, mount_root: &s
     if request.pid <= 0 || request.uid < 10_000 {
         return;
     }
-    // 探针后端根：重定向应用=沙盒根（视图根直接对射），未配置应用=真实存储根。
-    let backend_root = if request.redirect_target.starts_with("/data/media/") {
-        request.redirect_target.trim_end_matches('/').to_string()
-    } else {
-        "/data/media/0".to_string()
+    let Some(host) = crate::fuse_host::get_fuse_host() else {
+        return;
     };
+    if PROBING.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let app_pid = request.pid;
     let app_uid = request.uid;
-    let mount_root = mount_root.to_string();
+    let user_id = crate::platform::user_id_from_uid(app_uid);
+    let host_pid = host.child_pid;
+    let host_start = host.child_start_time_ticks;
+    let host_dev = host.dev.clone();
+    let probe_view = format!(
+        "/proc/{host_pid}/root{}/{user_id}/Android/data/.nomedia",
+        host.mount_point
+    );
     let package_name = request.package_name.clone();
     let spawn_result = std::thread::Builder::new()
         .name("srx-pt-probe".into())
         .spawn(move || {
-            run_passthrough_probe(
-                app_pid,
-                app_uid,
-                host_pid,
-                &mount_root,
-                &backend_root,
-                &package_name,
-            );
+            match read_passthrough_probe(&probe_view, &host_dev) {
+                Ok(ok) => {
+                    crate::config::write_fuse_passthrough_probe_state(ok);
+                    if ok {
+                        log::info!(
+                            "passthrough probe ok pkg={package_name} uid={app_uid} pid={app_pid}"
+                        );
+                    } else {
+                        log::warn!("passthrough probe EIO pkg={package_name} host={host_pid}");
+                        crate::fuse_terminate::terminate_fuse_process(host_pid, Some(host_start));
+                    }
+                }
+                Err(error) => {
+                    log::warn!("passthrough probe inconclusive path={probe_view} err={error}");
+                }
+            }
+            PROBING.store(false, Ordering::Relaxed);
         });
     if let Err(error) = spawn_result {
+        PROBING.store(false, Ordering::Relaxed);
         log::warn!("passthrough probe spawn failed err={}", error);
     }
 }
 
-fn run_passthrough_probe(
-    app_pid: i32,
-    app_uid: i32,
-    host_pid: i32,
-    mount_root: &str,
-    backend_root: &str,
-    package_name: &str,
-) {
-    use std::io::Read;
+fn read_passthrough_probe(path: &str, host_dev: &str) -> std::io::Result<bool> {
+    use std::io::{Error, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let probe_backend = format!(
-        "{}/{}",
-        backend_root.trim_end_matches('/'),
-        PASSTHROUGH_PROBE_REL
-    );
-    // 历史残留自愈：上次探测若在删除前被中断（进程被杀、系统重启），探针文件
-    // 会遗留在存储根。先清一次旧残留再写入本次探针，保证异常路径不累积垃圾。
-    let _ = std::fs::remove_file(&probe_backend);
-    if let Err(error) = std::fs::write(&probe_backend, b"srx1") {
-        log::warn!(
-            "passthrough probe file create failed pkg={} path={} err={}",
-            package_name,
-            probe_backend,
-            error
-        );
-        return;
+    let inode = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = inode.metadata()?;
+    let dev = metadata.dev();
+    if !metadata.is_file() || format!("{}:{}", libc::major(dev), libc::minor(dev)) != host_dev {
+        return Err(Error::from_raw_os_error(libc::EXDEV));
     }
-    // 探针文件落盘后立即可经 FUSE 视图 open（按路径解析，不依赖 readdir 缓存）。
-    // 经应用命名空间（/proc/<pid>/root）解析视图根，保证 FUSE 挂载栈顶就是本模块
-    // 会话；open 以 root 执行（见函数级注释：setfsuid 方案被内核 DAC 缓存证伪）。
-    let probe_view = format!(
-        "/proc/{}/root{}/{}",
-        app_pid,
-        mount_root.trim_end_matches('/'),
-        PASSTHROUGH_PROBE_REL
-    );
-    let open_result = std::fs::File::open(&probe_view).and_then(|mut file| {
-        let mut buffer = [0u8; 4];
-        file.read_exact(&mut buffer)
-    });
-    let _ = std::fs::remove_file(&probe_backend);
-    match open_result {
-        Ok(()) => {
-            crate::config::write_fuse_passthrough_probe_state(true);
-            log::info!(
-                "passthrough probe ok pkg={} uid={} pid={}",
-                package_name,
-                app_uid,
-                app_pid
-            );
-        }
-        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-            crate::config::write_fuse_passthrough_probe_state(false);
-            log::warn!(
-                "passthrough probe EIO pkg={} uid={} pid={} host={} — kernel passthrough broken, demoting device and rebuilding host",
-                package_name,
-                app_uid,
-                app_pid,
-                host_pid
-            );
-            // 重建宿主：新会话 init 读到 broken 即关闭 passthrough。宿主换代与
-            // 应用重挂走既有的 health-check/invalidate 恢复通路。
-            crate::fuse_terminate::terminate_fuse_process(host_pid, None);
-        }
-        Err(error) => {
-            // 探针自身不可执行（SELinux/时序）：不判定，保持开启（与旧行为一致）。
-            log::warn!(
-                "passthrough probe inconclusive pkg={} uid={} pid={} path={} err={}",
-                package_name,
-                app_uid,
-                app_pid,
-                probe_view,
-                error
-            );
-        }
+    // 按已核对的 inode 重开；路径替换或卸载不能把其它文件系统的结果算作本宿主的判定。
+    let read = std::fs::File::open(format!("/proc/self/fd/{}", inode.as_raw_fd()))
+        .and_then(|mut file| file.read(&mut [0]));
+    match read {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(false),
+        Err(error) => Err(error),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/native-unit/passthrough_probe.rs"]
+mod passthrough_probe_tests;
 
 fn set_mount_namespace(ns_path: Option<&CStr>) -> bool {
     // 路径在 fork 之前就已经转换好，这里只做 open/setns，避免子进程再次堆分配。
