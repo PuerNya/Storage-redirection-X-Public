@@ -3054,7 +3054,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
         self.assertIn("optional_storage_alias_absent path=", storage)
 
-    def test_media_provider_readiness_rejects_query_errors_and_uses_ps_fallback(self) -> None:
+    def test_media_provider_readiness_rejects_query_errors_and_uses_registered_provider(self) -> None:
         flow = read(".github/tests/run-storage-redirect-scenarios.sh")
         query = section(flow, "media_provider_query_ready()", "wait_media_provider_ready()")
         self.assertIn('timeout 15s adb shell content query', query)
@@ -3071,7 +3071,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "timeout --kill-after=30s 180s bash -c 'capture_test_flow_artifacts'", flow
         )
         pid = section(flow, "media_provider_pid()", "wait_media_provider_hook_ready()")
-        self.assertIn("ps -A -o PID,NAME,ARGS", pid)
+        self.assertIn('adb shell sh < "$SRT_MEDIA_PROVIDER_PID_SCRIPT"', pid)
+        self.assertIn('media-provider-pid.sh', flow)
+        self.assertIn('media-provider-pid.sh', self.powershell)
+        self.assertIn('media-provider-pid.sh', read(".github/tests/install-storage-redirect-module.sh"))
 
     def test_bash_prepares_mapping_source_on_real_backend(self) -> None:
         prepare = section(

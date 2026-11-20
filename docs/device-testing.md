@@ -322,7 +322,7 @@ Android 17（API 37.0）有三处执行环境差异：
 | 27 | 启用文件监控且使用 FUSE 数据面时，MediaStore 系统代写覆盖放行成功、映射成功、最终只读失败、只读排除成功。 |
 | 28 | 启用 `read_only_paths=["Pictures/SrtReadOnlyMedia"]`，预置真实图片并扫描进 MediaStore，验证测试 APP 通过 MediaStore 查询仍能看到只读真实路径下的图片行。 |
 | 29 | 配置热更新：测试 APP 已运行时，先验证默认重定向写入应用私有空间，再不重启应用改为 `path_mappings`，要求同一进程后续写入切换到映射后的真实目录。 |
-| 30 | MediaProvider 集合 URI 的 `openTypedAssetFile` 保持集合级直通，不误套用单行重映射。 |
+| 30 | 以应用结果中的 UID、PID 对照用户 0 已发布的媒体提供器，核对同一线程上的 `openTypedAssetFile` 集合 URI 请求和直通记录。 |
 | 31 | 关闭应用重定向后，缩略图和完整图片仍可从真实 MediaStore 路径读取。 |
 | 32 | 真实后端端点短暂恢复后，应用重启仍能完成挂载，不要求重启 MediaProvider。 |
 | 33 | MediaProvider 热重启后保留应用挂载，并继续完成图片保存。 |

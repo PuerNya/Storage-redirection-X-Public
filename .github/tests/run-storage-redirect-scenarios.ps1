@@ -1350,11 +1350,9 @@ function Wait-MediaProviderReady {
 }
 
 function Get-MediaProviderPid {
-    $output = @(
-        Invoke-Su "for package in com.android.providers.media.module com.google.android.providers.media.module com.android.providers.media android.process.media; do pidof `"`$package`" 2>/dev/null || true; done"
-    ) -join "`n"
-    $match = [regex]::Match($output, '(?m)^\s*(\d+)')
-    if ($match.Success) { $match.Groups[1].Value } else { "" }
+    $command = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "media-provider-pid.sh")
+    $output = (& adb -s $Serial shell $command) -join "`n"
+    if ($LASTEXITCODE -eq 0 -and $output.Trim() -match '^[1-9][0-9]*$') { $output.Trim() } else { "" }
 }
 
 function Test-MediaProviderIsLazy {
@@ -3975,9 +3973,13 @@ function Invoke-MediaStoreOpenTypedCollectionScenario {
     Wait-MediaProviderReady "$Scenario/typed-collection" 60 | Out-Null
     if (-not (Wait-MediaProviderHookReady "$Scenario/typed-collection" 60)) { return $false }
     $result = Invoke-ServiceCase "scenario-$Scenario" "typed-collection" "mediastore_open_typed_collection" @{} "^PASS \[mediastore_open_typed_collection\]"
-    $logcat = (Invoke-Adb @("logcat", "-d", "-s", "SRX:V")) -join "`n"
-    if ($logcat -notmatch "java open delegate reason=collection_uri_passthrough") {
-        $script:Failures.Add("scenario-$Scenario/typed-collection missing collection URI passthrough log")
+    $mediaPid = Get-MediaProviderPid
+    if (-not $mediaPid) { $script:Failures.Add("scenario-$Scenario/typed-collection missing media provider PID"); return $false }
+    $providerLog = Join-Path $script:ArtifactDir "scenario-$Scenario-provider.log"
+    Invoke-Adb @("logcat", "-d", "-v", "threadtime", "--pid", $mediaPid, "-s", "SRX:V") | Set-Content -LiteralPath $providerLog -Encoding utf8
+    & python "$PSScriptRoot/verify-collection-delegation.py" "$script:ArtifactDir/scenario-$Scenario-typed-collection-result.txt" $providerLog $mediaPid
+    if ($LASTEXITCODE -ne 0) {
+        $script:Failures.Add("scenario-$Scenario/typed-collection missing delegation for fixture caller")
         return $false
     }
     $result.Ok

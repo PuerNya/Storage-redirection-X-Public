@@ -165,6 +165,7 @@ DL_OWNER_MAPPED_BACKEND_FILE="${BACKEND_ROOT}/${DL_OWNER_MAPPED_REL}/${DL_OWNER_
 # 转发，不依赖模拟器外部网络）；显式设置时优先使用该外源。
 SRT_DOWNLOAD_URL="${SRT_DOWNLOAD_URL:-}"
 SRT_DOWNLOAD_NETWORK_HELPER="$(base64 < "$(dirname "${BASH_SOURCE[0]}")/prepare-download-test-network.sh" | tr -d '\n')"
+export SRT_MEDIA_PROVIDER_PID_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/media-provider-pid.sh"
 # 场景 40：系统 uid 的 FUSE 写入按发起服务归因夹具。shell（uid 2000）延迟
 # mkdir 制造确定的系统 uid FUSE 请求，断言监视记录按发起进程归因（此前
 # 该类请求只能记录 unknown 或误归组内成员）。
@@ -1902,9 +1903,7 @@ wait_media_provider_ready() {
 }
 
 media_provider_pid() {
-  adb_su "for package in com.android.providers.media.module com.google.android.providers.media.module com.android.providers.media android.process.media; do pidof \"\$package\" 2>/dev/null || true; done; ps -A -o PID,NAME,ARGS 2>/dev/null | awk '\$0 ~ /providers\\.media|android\\.process\\.media/ {print \$1}'" |
-    tr -d '\r' |
-    awk 'NF && pid == "" { pid = $1 } END { if (pid != "") print pid }'
+  adb shell sh < "$SRT_MEDIA_PROVIDER_PID_SCRIPT" | tr -d '\r'
 }
 
 # MediaProvider 就绪缓存：wait_media_provider_ready 在 API<37 要顺序探测 10 个
@@ -4927,14 +4926,15 @@ run_nested_mapping_chain_scenario() {
 }
 
 run_mediastore_open_typed_collection_scenario() {
-  local scenario="$1"
+  local scenario="$1" media_pid evidence="$SRT_ARTIFACT_DIR/scenario-$1-provider.log"
   wait_media_provider_ready "scenario-${scenario}-typed-collection" 60 || return 1
   ensure_media_provider_hook_ready "scenario-${scenario}-typed-collection" || return 1
   run_service_case "$scenario" "typed-collection" "mediastore_open_typed_collection" '^PASS \[mediastore_open_typed_collection\]' || return 1
-  if ! adb shell logcat -d -s SRX:V 2>/dev/null | grep -q "java open delegate reason=collection_uri_passthrough"; then
-    echo "typed_collection_passthrough_log_missing scenario=${scenario}" >&2
-    return 1
-  fi
+  media_pid="$(media_provider_pid)"
+  [[ "$media_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  adb logcat -d -v threadtime --pid "$media_pid" -s SRX:V > "$evidence" || return 1
+  python3 "$(dirname "$SRT_MEDIA_PROVIDER_PID_SCRIPT")/verify-collection-delegation.py" \
+    "$SRT_ARTIFACT_DIR/scenario-$scenario-typed-collection-result.txt" "$evidence" "$media_pid"
 }
 
 # 仅映射模式自有目录属主漂移契约（2026-10-21 起契约反转）：

@@ -6,6 +6,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.provider.MediaStore
 import android.util.Size
 import java.io.File
@@ -318,10 +319,11 @@ class MediaStoreTestCases(
           } catch (e: FileNotFoundException) {
             providerMessage = e.message.orEmpty()
           }
+          val outcome =
+              providerMessage?.let { "collection URI delegated to provider ($it)" }
+                  ?: "collection URI open delegated without remapping"
           testCase.pass(
-              message =
-                  providerMessage?.let { "collection URI delegated to provider ($it)" }
-                      ?: "collection URI open delegated without remapping",
+              message = "$outcome caller_uid=${Process.myUid()} caller_pid=${Process.myPid()}"
           )
         } finally {
           source.close()

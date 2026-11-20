@@ -480,9 +480,7 @@ verify_zygisk_injection_chain() {
 }
 
 media_provider_pid() {
-  adb_su 'for package in com.android.providers.media.module com.google.android.providers.media.module com.android.providers.media android.process.media; do pidof "$package" 2>/dev/null || true; done' |
-    tr -d '\r' |
-    awk 'NF { print $1; exit }'
+  adb shell sh < "$(dirname "${BASH_SOURCE[0]}")/media-provider-pid.sh" | tr -d '\r'
 }
 
 restart_media_provider_process() {

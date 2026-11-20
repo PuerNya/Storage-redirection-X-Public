@@ -220,11 +220,11 @@ public class Hooker {
     enterProviderCallerScope(args, callerUid, callerPid);
     try {
       Object[] actualArgs = unwrapArgs(args);
-      logOpenArgs(this, actualArgs, callerUid, callerPid);
       if (!isMediaProviderHookerOrReceiver(this, args) && !hasMediaStoreUriArg(actualArgs)) {
         return callBackupPassthrough(args);
       }
       boolean redirectEnabled = isRedirectEnabledForCallerUid(callerUid);
+      logOpenArgs(this, actualArgs, callerUid, callerPid, redirectEnabled);
       if (!redirectEnabled) {
         // 未开启重定向的调用方必须保持 MediaProvider 原始 URI/FD 语义。
         // 这里若继续尝试映射文件，可能把未配置应用的原图读取带入其它调用方
@@ -4858,7 +4858,8 @@ public class Hooker {
     }
   }
 
-  private static void logOpenArgs(Hooker hooker, Object[] args, int callerUid, int callerPid) {
+  private static void logOpenArgs(
+      Hooker hooker, Object[] args, int callerUid, int callerPid, boolean redirectEnabled) {
     if (!shouldLog()) return;
     if (OPEN_LOG_COUNT >= 96) return;
     OPEN_LOG_COUNT++;
@@ -4875,6 +4876,8 @@ public class Hooker {
               + callerUid
               + " caller_pid="
               + callerPid
+              + " redirect_enabled="
+              + redirectEnabled
               + " args="
               + describeQueryArgs(args));
     } catch (Throwable ignored) {
