@@ -293,7 +293,7 @@ Android 17（API 37.0）有三处执行环境差异：
 | --- | --- |
 | `basic/all` | 默认开启重定向后，验证 MediaStore 创建、读、写，以及文件 API 的 list/create/read/write/stat/access/truncate/ftruncate；不自动执行 MediaStore 删除、缩略图、query-path、chmod、link 或 symlink 用例。 |
 | 1 | 无应用配置时保持真实路径写入。 |
-| 2 | 默认重定向写入应用私有空间。 |
+| 2 | 默认重定向写入应用私有空间。MediaStore 写入分别验证公共父目录原先缺失和原先为空的情况，校验沙盒文件落点、缺失目录保持缺失、已有目录的设备号、inode、权限和属主保持一致且目录仍为空。 |
 | 3 | `path_mappings` 将 `Download/SrtProbe` 映射到 `Download/Test`。 |
 | 4 | 路径映射叠加真实路径放行时，映射优先。 |
 | 5 | `allowed_real_paths=["Download"]` 时保持真实路径写入。 |

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from test_mount_metadata_scope import function_body
+from test_mount_identity_syntax import extract_fn
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -298,15 +299,30 @@ public class PublicFallbackFixture {
 
 
 class MediaDirectoryScopeTest(unittest.TestCase):
-    def test_column_redirect_registers_existing_scoped_cleanup(self):
+    def test_column_redirect_exposes_ready_sandbox_before_provider_queries(self):
         source = (ROOT / "java_src/org/srx/hook/Hooker.java").read_text(encoding="utf-8")
         body = function_body(source, "public Object providerMediaFileColumnCallback(")
-        self.assertIn("rememberProviderRedirectSourceDirectory(publicParent.getPath(), directParent.getPath())", body)
-        self.assertLess(body.index("finally"), body.index("rememberProviderRedirectSourceDirectory"))
-        native = (ROOT / "src/hook/ops/mutation/dir.rs").read_text(encoding="utf-8")
-        cleanup = function_body(native, "pub(crate) fn cleanup_provider_redirect_source_directory(")
-        self.assertIn("is_public_default_sandbox_redirect", cleanup)
-        self.assertIn("libc::rmdir", function_body(native, "fn cleanup_empty_redirect_source_dir("))
+        self.assertIn("new File(publicPath).getParent()", body)
+        self.assertIn("new File(directPath).getParent()", body)
+        self.assertNotIn(".getParentFile()", body)
+        registration = body.index("rememberProviderRedirectSourceDirectory(publicParent, directParent)")
+        self.assertLess(body.index("new File(directParent).isDirectory()"), registration)
+        self.assertLess(registration, body.index("MEDIA_FILE_BUILD_CONTEXT.set"))
+
+    def test_nested_directory_queries_expire_without_touching_public_storage(self):
+        context = (ROOT / "src/hook/context.rs").read_text(encoding="utf8")
+        methods = ("enter_provider_passthrough", "exit_provider_passthrough", "is_provider_passthrough_active",
+                   "enter_provider_virtual_scope", "exit_provider_virtual_scope", "is_provider_virtual_scope_active",
+                   "clear_provider_virtual_dirs_if_idle", "remember_provider_passthrough_virtual_dir",
+                   "provider_passthrough_virtual_dir_target")
+        fixture = (ROOT / ".github/tests/harness/provider_directory_scope.rs").read_text(encoding="utf8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scope.rs"
+            binary = root / ("scope.exe" if os.name == "nt" else "scope")
+            source.write_text(fixture + "\n" + "\n".join(extract_fn(context, name) for name in methods), encoding="utf8")
+            subprocess.run(["rustc", "--edition=2024", source, "-o", binary], check=True, timeout=60)
+            subprocess.run([binary], cwd=root, check=True, timeout=30)
 
 
 class FuseBackingLifetimeTest(unittest.TestCase):

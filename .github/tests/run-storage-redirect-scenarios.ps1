@@ -3020,6 +3020,7 @@ function Invoke-StandardScenario {
             $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok
             $mediaFile = "srt_mediastore_sandbox_only.txt"
             if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-before-mediastore")) { return $false }
+            if (-not (Require-Missing "scenario-$Scenario" "mediastore-public-parent-before" "$BackendRoot/Documents/SrtMediaRoutingProbe")) { return $false }
             $mediaResult = Invoke-MediaStoreCreateCase $Scenario "mediastore-sandbox-only" @{ file_name = $mediaFile; relative_path = "Documents/SrtMediaRoutingProbe" }
             $ok = $mediaResult.Ok -and $ok
             # 断言前立即采集 hook 证据，此时 logcat buffer 仍覆盖本次 insert。
@@ -3027,6 +3028,16 @@ function Invoke-StandardScenario {
             $ok = (Require-File "scenario-$Scenario" "mediastore-sandbox-file" "$PrivateMediaStoreRoutingProbeRoot/$mediaFile") -and $ok
             $ok = (Require-Missing "scenario-$Scenario" "mediastore-public-file" "$MediaStoreRoutingProbeRoot/$mediaFile") -and $ok
             $ok = (Require-Missing "scenario-$Scenario" "mediastore-public-parent" "$BackendRoot/Documents/SrtMediaRoutingProbe") -and $ok
+            $publicParent = "$BackendRoot/Documents/SrtMediaRoutingProbe"
+            $identity = Get-SuValue "mkdir '$publicParent' && stat -c '%d:%i:%f:%u:%g' '$publicParent'"
+            if ($identity -notmatch '^\d+:\d+:[0-9a-fA-F]+:\d+:\d+$') { throw "Could not establish the empty public directory fixture: $publicParent" }
+            $preservedFile = "srt_mediastore_preserved_parent.txt"
+            $ok = (Invoke-ServiceCase "scenario-$Scenario" "mediastore-existing-parent" "mediastore_create_file" @{ file_name = $preservedFile; relative_path = "Documents/SrtMediaRoutingProbe" } '^PASS \[mediastore_create_file\]').Ok -and $ok
+            $ok = (Require-File "scenario-$Scenario" "mediastore-existing-parent-sandbox-file" "$PrivateMediaStoreRoutingProbeRoot/$preservedFile") -and $ok
+            if (-not (Test-Su "test `"`$(stat -c '%d:%i:%f:%u:%g' '$publicParent')`" = '$identity' && children=`$(ls -A '$publicParent') && test -z `"`$children`"")) {
+                $script:Failures.Add("scenario-$Scenario/mediastore-existing-parent changed or populated: $publicParent")
+                $ok = $false
+            }
             $ok = (Test-PublicDirectoryOwner "scenario-$Scenario" "android-owner" "$BackendRoot/Android") -and $ok
         }
         3 { $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok }

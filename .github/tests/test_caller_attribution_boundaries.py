@@ -497,7 +497,7 @@ class CallerAttributionBoundariesTest(unittest.TestCase):
         self.assertIn("snapshot.running_packages.is_none()", resolver)
         self.assertNotIn('read_dir("/proc")', resolver)
 
-    def test_provider_directory_reports_existing_target_and_cleans_empty_source(self) -> None:
+    def test_provider_directory_registration_only_affects_queries(self) -> None:
         java = read("java_src/org/srx/hook/Hooker.java")
         jni = read("src/java_hook/hooker_class.rs")
         directory = read("src/hook/ops/mutation/dir.rs")
@@ -521,12 +521,12 @@ class CallerAttributionBoundariesTest(unittest.TestCase):
         )
         self.assertIn("enterProviderVirtualScope()", mutation)
         self.assertIn("exitProviderVirtualScope()", mutation)
-        self.assertIn("for (source, target) in crate::hook::exit_provider_passthrough()", jni)
-        self.assertIn("for (source, target) in crate::hook::exit_provider_virtual_scope()", jni)
+        for scope in ("passthrough", "virtual_scope"):
+            name = f"exit_provider_{scope}"
+            self.assertEqual(extract_fn(jni, name).split("{", 1)[1].strip(), f"crate::hook::{name}();\n}}")
         self.assertIn("remember_provider_redirect_source_directory", jni)
-        self.assertIn("cleanup_provider_redirect_source_directory", jni)
         self.assertIn("is_public_default_sandbox_redirect(source_path, target_path)", directory)
-        self.assertIn("libc::rmdir(c_path.as_ptr())", directory)
+        self.assertNotIn("cleanup_empty_redirect_source_dir", extract_fn(directory, "handle_mkdir_like<F>"))
 
     def test_disabled_provider_open_does_not_enter_mapped_file_branch(self) -> None:
         java = read("java_src/org/srx/hook/Hooker.java")

@@ -4680,6 +4680,7 @@ run_standard_scenario() {
   if [ "$scenario" = "2" ]; then
     local media_file="srt_mediastore_sandbox_only.txt"
     ensure_media_provider_hook_ready "scenario-${scenario}-before-mediastore" || return 1
+    check_file_missing "scenario-${scenario}-mediastore-public-parent-before" "${BACKEND_ROOT}/Documents/SrtMediaRoutingProbe" || return 1
     # run_service_case 完成后立即采集 MediaProvider hook 状态（无论成功失败均采集），
     # 此时 logcat buffer 仍包含本次 insert 的 SRX 回调日志。
     # capture_scenario2_mediastore_hook_diag 写入独立 artifact，不影响断言链。
@@ -4692,6 +4693,15 @@ run_standard_scenario() {
       check_file_missing "scenario-${scenario}-mediastore-public-file" "${MEDIASTORE_ROUTING_PROBE_ROOT}/${media_file}" &&
       check_file_missing "scenario-${scenario}-mediastore-public-parent" "${BACKEND_ROOT}/Documents/SrtMediaRoutingProbe" &&
       check_public_directory_owner "scenario-${scenario}-android" "${BACKEND_ROOT}/Android" || return 1
+    local public_parent="${BACKEND_ROOT}/Documents/SrtMediaRoutingProbe" identity preserved_file="srt_mediastore_preserved_parent.txt"
+    identity=$(adb_su "mkdir '$public_parent' && stat -c '%d:%i:%f:%u:%g' '$public_parent'") || return 1
+    [[ $identity =~ ^[0-9]+:[0-9]+:[0-9a-fA-F]+:[0-9]+:[0-9]+$ ]] || return 1
+    run_service_case "$scenario" "mediastore-existing-parent" "mediastore_create_file" '^PASS \[mediastore_create_file\]' --es file_name "$preserved_file" --es relative_path "Documents/SrtMediaRoutingProbe" || return 1
+    check_file_exists "scenario-${scenario}-mediastore-existing-parent-sandbox-file" "${PRIVATE_MEDIASTORE_ROUTING_PROBE_ROOT}/${preserved_file}" || return 1
+    adb_su "test \"\$(stat -c '%d:%i:%f:%u:%g' '$public_parent')\" = '$identity' && children=\$(ls -A '$public_parent') && test -z \"\$children\"" || {
+      echo "scenario-${scenario}/mediastore-existing-parent changed or populated: $public_parent" >&2
+      return 1
+    }
   fi
   if [ "$scenario" = "5" ]; then
     check_public_directory_owner "scenario-${scenario}-download" "${BACKEND_ROOT}/Download" || return 1

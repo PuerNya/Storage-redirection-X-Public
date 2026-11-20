@@ -1004,9 +1004,7 @@ unsafe extern "C" fn enter_provider_passthrough(_env: *mut JNIEnv, _class: jclas
 }
 
 unsafe extern "C" fn exit_provider_passthrough(_env: *mut JNIEnv, _class: jclass) {
-    for (source, target) in crate::hook::exit_provider_passthrough() {
-        crate::hook::cleanup_provider_redirect_source_directory(&source, &target);
-    }
+    crate::hook::exit_provider_passthrough();
 }
 
 unsafe extern "C" fn enter_provider_virtual_scope(_env: *mut JNIEnv, _class: jclass) {
@@ -1014,9 +1012,7 @@ unsafe extern "C" fn enter_provider_virtual_scope(_env: *mut JNIEnv, _class: jcl
 }
 
 unsafe extern "C" fn exit_provider_virtual_scope(_env: *mut JNIEnv, _class: jclass) {
-    for (source, target) in crate::hook::exit_provider_virtual_scope() {
-        crate::hook::cleanup_provider_redirect_source_directory(&source, &target);
-    }
+    crate::hook::exit_provider_virtual_scope();
 }
 
 unsafe extern "C" fn is_debug_logging_enabled(
