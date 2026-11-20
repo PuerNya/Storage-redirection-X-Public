@@ -132,7 +132,7 @@ fn patch_backoff(index: usize, now_ms: i64) {
 ///
 /// 两库均晚于 hook 安装按需加载，install 时的符号注册覆盖不到。沿用 fuse_fix
 /// 的补装方式：ElfImg 定位（APK 内嵌 ELF 通道）后直接改写 read 与 __read_chk
-/// 的 PLT 槽，包装函数直调 libc::read 并按严格校验解析 FUSE 协议头，**完全不
+/// 的 PLT 槽，包装函数分别调用 libc 的原始读取入口并校验 FUSE 协议头，**完全不
 /// 进入 srx_hook 的 call_prev/with_prev_func 体系**——同一 proxy 地址被
 /// hook_partial 与 hook_single 双重注册会破坏 prev 查找链，把 MediaProvider
 /// 的全部 read 调用打崩（2026-10-24 真机事故：MP 崩溃循环，已回滚）。
@@ -267,18 +267,18 @@ unsafe extern "C" fn hooked_read_fuse(fd: c_int, buf: *mut c_void, count: usize)
     result
 }
 
-/// libfuse.so 的 __read_chk 包装（FORTIFY 加固版，多一个 buf_size 参数）。
-///
-/// 直调 libc::read 跳过 abort 检查：buf_size 检查是编译期加固，调用方传入的
-/// count 不会超过自身缓冲区，行为与原实现等价。
+unsafe extern "C" {
+    fn __read_chk(fd: c_int, buf: *mut c_void, count: usize, buf_size: usize) -> isize;
+}
+
+/// 保留 bionic 对目标缓冲区大小的运行时检查，再解析成功读取的请求头。
 unsafe extern "C" fn hooked_read_chk_fuse(
     fd: c_int,
     buf: *mut c_void,
     count: usize,
-    _buf_size: usize,
+    buf_size: usize,
 ) -> isize {
-    // SAFETY: 同 hooked_read_fuse，libc::read 直达原实现。
-    let result = libc::read(fd, buf, count);
+    let result = __read_chk(fd, buf, count, buf_size);
     parse_fuse_header_after_read(fd, buf, result);
     result
 }

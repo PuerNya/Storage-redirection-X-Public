@@ -1,7 +1,11 @@
 """用虚拟时钟和排队器执行生产晚加载重试，验证退避、合并及排队失败。"""
 
+import ctypes
+import os
 import shutil
+import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +16,45 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class FuseLateLoadTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "需要 Linux 动态库和管道")
+    def test_loaded_checked_read_reports_only_complete_request_identity(self) -> None:
+        read = (ROOT / "src/hook/ops/read.rs").read_text(encoding="utf8")
+        start = read.index('unsafe extern "C" {\n    fn __read_chk(')
+        wrappers = read[start:read.index("// 借用 FUSE 协议头", start)]
+        wrappers = wrappers.replace('unsafe extern "C" fn hooked_read_chk_fuse', '#[unsafe(no_mangle)]\npub unsafe extern "C" fn hooked_read_chk_fuse')
+        fixture = '''use std::ffi::{c_int, c_void};
+mod context {
+    use std::cell::Cell;
+    thread_local! { pub static CALLER: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; }
+    pub fn set_fuse_caller_uid(uid: i32) { CALLER.update(|(_, pid)| (uid, pid)); }
+    pub fn set_fuse_caller_pid(pid: i32) { CALLER.update(|(uid, _)| (uid, pid)); }
+}
+#[unsafe(no_mangle)] pub extern "C" fn caller() -> u64 {
+    let (uid, pid) = context::CALLER.get(); ((uid as u64) << 32) | pid as u64
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="srx-checked-read-") as directory:
+            source, library = Path(directory, "engine.rs"), Path(directory, "engine.so")
+            source.write_text(fixture + wrappers, encoding="utf8")
+            subprocess.run(["rustc", "--edition=2024", "--crate-type=cdylib", str(source), "-o", str(library)], check=True, capture_output=True)
+            engine = ctypes.CDLL(str(library))
+            checked_read = engine.hooked_read_chk_fuse
+            checked_read.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t)
+            checked_read.restype = ctypes.c_ssize_t
+            engine.caller.restype = ctypes.c_uint64
+            header = struct.pack("=IIQQIIII", 40, 1, 13, 2, 10192, 10192, 782, 0)
+            read_fd, write_fd = os.pipe()
+            try:
+                buffer = ctypes.create_string_buffer(len(header))
+                for payload in (header[:8], header):
+                    os.write(write_fd, payload)
+                    self.assertEqual(checked_read(read_fd, buffer, len(header), len(buffer)), len(payload))
+                    self.assertEqual(buffer.raw[:len(payload)], payload)
+                    self.assertEqual(engine.caller(), (10192 << 32 | 782) if payload == header else 0)
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
+
     def test_profiles_and_retry_events(self) -> None:
         rustc = shutil.which("rustc")
         self.assertIsNotNone(rustc)
